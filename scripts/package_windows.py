@@ -9,7 +9,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,12 +46,10 @@ def dependency_notices(executable):
     if not python_license.is_file():
         raise RuntimeError("Python runtime license text is missing")
     notices["LICENSES/Python-LICENSE.txt"] = python_license.read_bytes()
-    for name, url in LICENSE_URLS.items():
-        request = urllib.request.Request(url, headers={"User-Agent": "ClaudeBridge-release-builder"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            text = response.read(100_000)
+    for name in LICENSE_URLS:
+        text = (ROOT / "LICENSES" / name).read_bytes()
         if b"GNU" not in text or b"<html" in text.lower():
-            raise RuntimeError("License download is not the expected plain text: " + name)
+            raise RuntimeError("Missing vendored plain-text license: " + name)
         notices["LICENSES/" + name] = text
     return versions, notices
 
