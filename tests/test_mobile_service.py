@@ -545,7 +545,7 @@ def test_probe_timeout_does_not_hide_latest_reply_or_repeat_each_poll(backend, m
     monkeypatch.setattr(backend.remote, "action", fail_probe)
     backend.service.capture()
     assert backend.service.reply["text"] == "Original reply" and not backend.service.reply["error"]
-    assert backend.service.target["ready"] is False and "最新回复已读取" in backend.service.target["reason"]
+    assert backend.service.target["ready"] is False and "当前任务回复已读取" in backend.service.target["reason"]
     clock[0] += 5
     backend.service.capture()
     assert len(probes) == 1 and backend.remote.count("capture") == 2
@@ -1065,6 +1065,69 @@ def test_live_reply_wrong_connection_is_rejected_before_paid_call(backend):
     result = run(backend, payload.model_copy(update={"connection_revision": "c" * 64}))
     assert result["state"] == "failed"
     assert backend.translator.reply_translations == []
+
+
+@pytest.mark.parametrize("scope,count,expected_scope,expected_count", [
+    ("current_turn", 3, "current_turn", 3), ("current_turn", True, "current_turn", 1),
+    ("current_turn", -1, "current_turn", 1), ("current_turn", "3", "current_turn", 1),
+    ("current_turn", 10001, "current_turn", 1), ("latest", 3, "latest", 1),
+    ("untrusted_scope", 3, "latest", 1),
+])
+def test_current_task_capture_scope_and_count_are_bounded(backend, scope, count, expected_scope, expected_count):
+    backend.service.accept_capture({"context": CONTEXT, "text": "Synthetic current task reply",
+        "scope": scope, "message_count": count}, CONTEXT)
+    assert backend.service.reply["scope"] == expected_scope
+    assert backend.service.reply["message_count"] == expected_count
+
+
+def test_cumulative_current_task_progress_retains_prior_messages_and_translations(backend):
+    messages = ["Initial task progress is available for translation.",
+                "A second progress message arrives for this same task.",
+                "A third final result completes the current task."]
+    config = backend.service.public_state("synthetic-csrf")
+    backend.service.target = {"context": CONTEXT, "ready": True, "mode": "Code"}
+    prior_translated = ""
+    for count in range(1, 4):
+        source = "\n\n".join(messages[:count])
+        backend.service.accept_capture({"context": CONTEXT, "text": source, "generating": count < 3,
+            "mode": "Code", "scope": "current_turn", "message_count": count}, CONTEXT)
+        assert backend.service.reply["text"] == source
+        assert backend.service.reply["scope"] == "current_turn" and backend.service.reply["message_count"] == count
+        result = run(backend, request("translate_reply", source_hash=backend.service.reply["source_hash"],
+            incremental=True, expected_context=CONTEXT, connection_revision=config["connection_revision"]))["result"]
+        assert result["translated_source"] == source and result["complete"]
+        assert result["translated_text"].startswith(prior_translated)
+        prior_translated = result["translated_text"]
+    assert [item[0] for item in backend.translator.reply_translations] == messages
+    assert backend.remote.count("send") == 0
+
+
+def test_new_user_turn_in_same_context_rejects_in_flight_previous_task_translation(backend):
+    first = "Previous task progress should not become the new task reply."
+    current = "A new user task in the same native conversation has its own progress."
+    payload = live_reply(backend, first)
+    backend.service.reply["turn_id"] = "1" * 64
+    original = backend.translator.translate_reply
+    def newer_turn(text, *, code_blocks):
+        backend.service.accept_capture({"context": CONTEXT, "text": current, "generating": True,
+            "scope": "current_turn", "message_count": 1, "turn_id": "2" * 64}, CONTEXT)
+        return original(text, code_blocks=code_blocks)
+    backend.translator.translate_reply = newer_turn
+    result = run(backend, payload)
+    assert result["state"] == "failed" and result["result"] is None
+    assert backend.service.reply["text"] == current and backend.service.reply["turn_id"] == "2" * 64
+    backend.translator.translate_reply = original
+    following = run(backend, request("translate_reply", source_hash=backend.service.reply["source_hash"],
+        incremental=True, expected_context=CONTEXT, connection_revision=payload.connection_revision))
+    assert following["result"]["turn_id"] == "2" * 64
+    assert following["result"]["translated_source"] == current
+    assert backend.remote.count("send") == 0
+
+
+@pytest.mark.parametrize("turn_id,expected", [("a" * 64, "a" * 64), ("wrong", ""), (123, ""), (None, "")])
+def test_capture_turn_identity_is_validated_without_breaking_legacy_reads(backend, turn_id, expected):
+    backend.service.accept_capture({"context": CONTEXT, "text": "Synthetic current task reply", "turn_id": turn_id}, CONTEXT)
+    assert backend.service.reply["turn_id"] == expected
 
 
 def test_live_reply_reuses_old_whole_reply_cache_as_incremental_prefix(backend):

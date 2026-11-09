@@ -172,6 +172,37 @@ def main():
             pool.drain()
             assert calls[calls_before_cache:] == [(appended, [])]
             assert window.terminal.toPlainText() == cached_text + "\n\n" + outputs[appended]
+            # Native current-turn snapshots accumulate progress rows instead
+            # of replacing each earlier progress message with the newest row.
+            progress = ["Current task progress one remains visible during later updates.",
+                        "Current task progress two is appended after the first message.",
+                        "The current task final result is appended as the third message."]
+            translated_prefix = ""
+            for count in range(1, 4):
+                cumulative = "\n\n".join(progress[:count])
+                window.accept_reply({"text": cumulative, "generating": count < 3, "context": "f" * 64,
+                                     "scope": "current_turn", "message_count": count})
+                assert window.reply_original == cumulative
+                if translated_prefix:
+                    assert window.terminal.toPlainText().startswith(translated_prefix)
+                pool.drain()
+                translated_prefix = "\n\n".join(outputs[message] for message in progress[:count])
+                assert window.terminal.toPlainText() == translated_prefix
+            # A new user task in the same native conversation has a distinct
+            # turn identity, so an earlier in-flight chunk cannot carry over.
+            previous_task = "Earlier task progress that finishes translation after a new task begins."
+            current_task = "The new user task has its own current progress reply."
+            window.accept_reply({"text": previous_task, "generating": True, "context": "f" * 64,
+                                 "scope": "current_turn", "turn_id": "1" * 64, "message_count": 1})
+            assert len(pool.pending) == 1
+            window.accept_reply({"text": current_task, "generating": True, "context": "f" * 64,
+                                 "scope": "current_turn", "turn_id": "2" * 64, "message_count": 1})
+            pool.one()
+            assert window.reply_turn_id == "2" * 64
+            assert window.terminal.toPlainText() == current_task
+            assert outputs[previous_task] not in window.terminal.toPlainText()
+            pool.drain()
+            assert window.terminal.toPlainText() == outputs[current_task]
             # Invalid imported settings remain a visible original-text state;
             # they cannot crash read rendering or initiate a request.
             before_invalid = len(calls)

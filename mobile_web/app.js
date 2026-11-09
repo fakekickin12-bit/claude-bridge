@@ -840,7 +840,7 @@
       const tracked = pendingReplyJob?.id === job.id ? pendingReplyJob : null;
       if (job.result?.incremental || tracked?.payload?.incremental) {
         const result = job.result;
-        const scope = result?.incremental ? replyStreamScope(result.context, job.profile, result.translation_revision, result.connection_revision) : tracked?.stream_scope;
+        const scope = result?.incremental ? replyStreamScope(result.context, job.profile, result.translation_revision, result.connection_revision, result.turn_id || "") : tracked?.stream_scope;
         if (job.state === "translated" && result?.incremental && scope && typeof result.translated_source === "string" &&
             typeof result.translated_text === "string" && typeof result.source === "string" && result.source.startsWith(result.translated_source)) {
           replyStreams.set(scope, result);
@@ -900,8 +900,8 @@
           ui.projectsButton?.setAttribute("aria-expanded", "false");
           stopProjectPolling();
         }
-        showNotice(job.action === "match_current" ? "已匹配 Ubuntu 当前对话，正在读取最新回复。当前草稿和附件已保留。" :
-          job.action === "new" ? "已打开新对话，当前草稿已保留。" : "已打开所选会话，正在读取最新回复。当前草稿已保留。");
+        showNotice(job.action === "match_current" ? "已匹配 Ubuntu 当前对话，正在读取当前任务回复。当前草稿和附件已保留。" :
+          job.action === "new" ? "已打开新对话，当前草稿已保留。" : "已打开所选会话，正在读取当前任务回复。当前草稿和附件已保留。");
       } else {
         if (replyNavigation?.id === job.id) {
           if (job.state === "unknown") replyNavigation = {...replyNavigation, await_state: true, uncertain: true};
@@ -985,9 +985,9 @@
     return hash && profile ? `${profile}|${revision ? `${revision}|` : ""}${hash}` : "";
   }
 
-  function replyStreamScope(context = currentReply()?.context, profile = selectedProfile, revision = undefined, connection = serverState?.connection_revision || "") {
+  function replyStreamScope(context = currentReply()?.context, profile = selectedProfile, revision = undefined, connection = serverState?.connection_revision || "", turn = currentReply()?.turn_id || "") {
     if (revision === undefined) revision = serverState?.profiles?.find(item => item.id === profile)?.translation_revision || "";
-    return context && profile && revision ? JSON.stringify([context, profile, revision, connection]) : "";
+    return context && profile && revision ? JSON.stringify([context, turn, profile, revision, connection]) : "";
   }
 
   function streamRequestKey(reply, scope, consumed) {
@@ -1022,8 +1022,8 @@
     const scope = streaming ? replyStreamScope(reply.context) : "";
     const progress = scope ? currentReplyStream(reply, scope) : null;
     let content = original;
-    let status = readError || (reply.loading ? "正在读取最后一条 Claude 回复…" :
-      matched ? "" : replyNavigation?.action === "match_current" ? "正在读取 Ubuntu 当前对话的最新回复…" : "正在读取所选会话的最新回复…");
+    let status = readError || (reply.loading ? "正在读取当前任务回复…" :
+      matched ? "" : replyNavigation?.action === "match_current" ? "正在读取 Ubuntu 当前对话的任务回复…" : "正在读取所选会话的当前任务回复…");
     if (!readError && replyTranslated && original) {
       if (streaming && scope) {
         if (progress) content = progress.translated_text + original.slice(progress.translated_source.length);
@@ -1052,9 +1052,9 @@
       if (atEnd) replyBody.scrollTop = replyBody.scrollHeight;
     }
     ui.replyEmpty.hidden = Boolean(content);
-    ui.replyEmpty.textContent = readError || (reply.loading ? "正在读取最后一条 Claude 回复…" :
+    ui.replyEmpty.textContent = readError || (reply.loading ? "正在读取当前任务回复…" :
       reply.read_status === "empty" ? reply.read_reason || "当前会话还没有 Claude 回复。" :
-      matched ? "当前会话的最新回复会显示在这里。" : "正在确认所选会话的回复…");
+      matched ? "当前任务的回复内容会显示在这里。" : "正在确认所选会话的回复…");
     ui.replyText.hidden = !content;
     ui.replyStatus.textContent = status;
     ui.replyToggle.setAttribute("aria-pressed", String(replyTranslated));

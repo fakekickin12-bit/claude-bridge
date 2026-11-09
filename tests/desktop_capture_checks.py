@@ -23,11 +23,11 @@ def rejected(call):
 
 with patch.object(d, "app", return_value=application), patch.object(d, "document", return_value=(page, attrs)), \
      patch.object(d, "code_panel", return_value=panel), patch.object(d, "reply_in_progress", return_value=False), \
-     patch.object(d, "latest_reply", return_value={"text": "Selected reply", "reply_count": 1, "code_blocks": []}) as body:
+     patch.object(d, "current_turn_reply", return_value={"text": "Selected reply", "reply_count": 1, "code_blocks": [], "scope": "current_turn"}) as body:
     result = d.dispatch({"action": "capture", "context": context})
     assert result["context"] == context and result["route"] == attrs["URI"].split("claude.ai")[1]
     assert result["text"] == "Selected reply" and result["mode"] == "Code"
-    body.assert_called_once_with(panel)
+    body.assert_called_once_with(panel, context)
     body.reset_mock()
     rejected(lambda: d.dispatch({"action": "capture", "context": "f" * 64}))
     body.assert_not_called()

@@ -447,7 +447,7 @@ class MobileBridge:
                 if self.target.get("context") != context or self.target_probe_connection != connection_key:
                     self.target = self.safe_target({"context": context, "mode": reply.get("mode"),
                         "title": reply.get("title", "当前会话"), "ready": False,
-                        "reason": "最新回复已读取，正在确认输入状态…"})
+                        "reason": "当前任务回复已读取，正在确认输入状态…"})
                 elif reply.get("generating"):
                     self.target = {**self.target, "ready": False, "busy": True, "reason": "Claude 正在回复"}
                 if (self.project_catalog.get("context")
@@ -489,13 +489,13 @@ class MobileBridge:
             except Exception:
                 with self.lock:
                     self.target = {**self.target, "ready": False,
-                                   "reason": "最新回复已读取；输入状态暂未确认，正在重新连接。"}
+                                   "reason": "当前任务回复已读取；输入状态暂未确认，正在重新连接。"}
             finally:
                 self.last_target_probe = time.monotonic()
         except core.BridgeError as exc:
             self.capture_failed(str(exc))
         except Exception:
-            self.capture_failed("暂时无法读取 Ubuntu 最新回复，正在重新连接。")
+            self.capture_failed("暂时无法读取 Ubuntu 当前任务回复，正在重新连接。")
         finally:
             self.remote_lock.release()
 
@@ -512,12 +512,19 @@ class MobileBridge:
         if not expected_context or reply.get("context") != expected_context:
             raise core.BridgeError("回复所属会话未确认，未显示其他项目的内容。")
         raw = reply.get("text", "").rstrip("\r\n")
+        scope = "current_turn" if reply.get("scope") == "current_turn" else "latest"
+        count = reply.get("message_count")
+        if (scope != "current_turn" or not isinstance(count, int) or isinstance(count, bool)
+                or not 0 <= count <= 10000):
+            count = 1 if raw else 0
+        turn_id = reply.get("turn_id", "")
+        turn_id = turn_id if isinstance(turn_id, str) and re.fullmatch(r"[0-9a-f]{64}", turn_id) else ""
         with self.lock:
             self.reply = {"text": raw, "source_hash": hashlib.sha256(raw.encode()).hexdigest() if raw else "",
                           "mode": reply.get("mode", ""), "context": expected_context, "loading": False,
                           "generating": bool(reply.get("generating")), "updated_at": time.time(), "error": "",
                           "read_status": reply.get("read_status") or ("ready" if raw else "empty"),
-                          "read_reason": reply.get("read_reason", ""), "scope": "latest"}
+                          "read_reason": reply.get("read_reason", ""), "scope": scope, "message_count": count, "turn_id": turn_id}
             self.code_blocks = [value for value in reply.get("code_blocks", []) if isinstance(value, str)]
 
     def translate_reply(self, payload):
@@ -569,12 +576,13 @@ class MobileBridge:
         connection_revision = hashlib.sha256(connection.encode()).hexdigest()
         if payload.get("connection_revision") != connection_revision:
             raise core.BridgeError("Ubuntu 连接已变化，请读取当前连接后继续翻译。")
-        scope = json.dumps([context, profile_id, revision, connection], ensure_ascii=False)
         with self.lock:
             reply = dict(self.reply)
             if (reply.get("context") != context or self.target.get("context") != context
                     or reply.get("loading") or reply.get("error")):
                 raise core.BridgeError("回复所属会话已变化，请等待当前会话的回复。")
+            turn_id = reply.get("turn_id", "")
+            scope = json.dumps([context, turn_id, profile_id, revision, connection], ensure_ascii=False)
             stream = self.reply_streams.get(scope)
             if stream is None:
                 stream = IncrementalReply()
@@ -626,15 +634,16 @@ class MobileBridge:
                 raise core.BridgeError("翻译期间 Ubuntu 连接已变化，旧连接译文未显示。")
             with self.lock:
                 latest = dict(self.reply)
-                if latest.get("context") != context or self.target.get("context") != context:
-                    raise core.BridgeError("翻译期间已切换会话，旧会话译文未显示。")
+                if (latest.get("context") != context or self.target.get("context") != context
+                        or latest.get("turn_id", "") != turn_id):
+                    raise core.BridgeError("翻译期间已切换会话或任务，旧任务译文未显示。")
                 stream.sync(latest.get("text", ""), generating=bool(latest.get("generating")),
                             scope=scope, code_blocks=self.code_blocks)
                 if not stream.accept(chunk, result):
                     raise core.BridgeError("回复正文已改写，旧分段译文未显示。")
         with self.lock:
             next_ready = stream.next_chunk() is not None
-            response = {"incremental": True, "context": context, "translation_revision": revision,
+            response = {"incremental": True, "context": context, "turn_id": turn_id, "translation_revision": revision,
                     "connection_revision": connection_revision,
                     "source": stream.source, "source_hash": hashlib.sha256(stream.source.encode()).hexdigest(),
                     "text": stream.render(), "translated_source": stream.translated_source,
@@ -646,6 +655,7 @@ class MobileBridge:
             whole_snapshot = None
             if (stream.complete and stream.source and stream.scope == scope
                     and self.reply.get("context") == context and self.target.get("context") == context
+                    and self.reply.get("turn_id", "") == turn_id
                     and self.reply.get("text") == stream.source and self.code_blocks == stream.code_blocks):
                 whole_snapshot = (translation_key(stream.source, profile, profile_id, stream.code_blocks),
                                   stream.source, {"text": stream.render(),
@@ -716,12 +726,12 @@ class MobileBridge:
                         self.reply["context"] = context
                         self.project_catalog = {"projects": [], "loading": False, "reason": ""}
                         self.projects_initialized = False
-                    self.update_job(job_id, "running", "已匹配，正在读取当前对话的最新回复", result)
+                    self.update_job(job_id, "running", "已匹配，正在读取当前任务回复", result)
                     try:
                         reply = client.action("capture", context=context, timeout=60)
                         self.accept_capture(reply, context)
                     except Exception as exc:
-                        self.capture_failed(str(exc) if isinstance(exc, core.BridgeError) else "当前对话已匹配，但最新回复读取未完成，请刷新重试。")
+                        self.capture_failed(str(exc) if isinstance(exc, core.BridgeError) else "当前对话已匹配，但当前任务回复读取未完成，请刷新重试。")
                         result = {**result, "reply_loading": True}
                     self.update_job(job_id, "submitted", "已匹配当前对话", result)
                     return True
@@ -757,7 +767,7 @@ class MobileBridge:
                             reply = client.action("capture", context=context, timeout=60)
                             self.accept_capture(reply, context)
                         except Exception as exc:
-                            self.capture_failed(str(exc) if isinstance(exc, core.BridgeError) else "已进入会话，但最新回复读取未完成，请刷新重试。")
+                            self.capture_failed(str(exc) if isinstance(exc, core.BridgeError) else "已进入会话，但当前任务回复读取未完成，请刷新重试。")
                             result = {**result, "reply_loading": True}
                     phase = "已打开项目最近对话" if action == "open_project" else "已切换会话" if result.get("switched") else "已读取项目会话"
                     self.update_job(job_id, "submitted", phase, result)

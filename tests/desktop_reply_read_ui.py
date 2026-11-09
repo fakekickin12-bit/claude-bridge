@@ -67,8 +67,8 @@ def main():
             window.pending_reply_context = old
             window.refresh(quiet=True)
             assert len(pool.pending) == 1 and not window.busy
-            assert "正在读取最后一条" in window.reply_translation_status.text()
-            assert "正在读取最后一条" in window.terminal.placeholderText()
+            assert "正在读取当前任务回复" in window.reply_translation_status.text()
+            assert "正在读取当前任务回复" in window.terminal.placeholderText()
             assert window.settings_actions["api"].isEnabled() and not window.source.isReadOnly()
             for _ in range(3): window.refresh(quiet=True)
             assert len(pool.pending) == 1

@@ -515,6 +515,70 @@ async function liveReplyLateResultCannotReplaceAnotherContextAndReloadUsesOrigin
     "Reload only queries the old request ID; it never resubmits it");
 }
 
+async function cumulativeCurrentTaskMessagesStayVisibleTogether() {
+  const messages = ["The first current task progress message remains visible.",
+    "The second current task progress message is appended.", "The third final result completes this task."];
+  class TaskService extends StreamService {
+    state() {
+      const state = super.state();
+      return {...state, reply: {...state.reply, scope: "current_turn", message_count: this.nativeText.split("\n\n").length}};
+    }
+    complete(payload) {
+      const result = {incremental: true, context: this.nativeContext, translation_revision: this.translationRevision,
+        connection_revision: this.connectionRevision, source: this.nativeText,
+        source_hash: crypto.createHash("sha256").update(this.nativeText).digest("hex"),
+        translated_source: this.nativeText, translated_text: this.nativeText.split("\n\n").map((_, index) => `当前任务第${index + 1}段译文。`).join("\n\n"),
+        complete: true, next_ready: false, generating: this.nativeGenerating};
+      return super.complete(payload, result);
+    }
+  }
+  const service = new TaskService();
+  service.nativeText = messages[0];
+  const page = browser(service, new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]));
+  await settle(() => page.elements.get("reply-text").textContent === "当前任务第1段译文。", "First current task message translated");
+  for (let count = 2; count <= 3; count += 1) {
+    service.mode = "queued";
+    service.nativeText = messages.slice(0, count).join("\n\n");
+    service.nativeGenerating = count < 3;
+    page.poll(5000);
+    await settle(() => service.posts.length === count, "Next cumulative current task snapshot");
+    const existing = page.elements.get("reply-text").textContent;
+    for (let index = 1; index < count; index += 1) assert(existing.includes(`当前任务第${index}段译文。`));
+    assert(existing.includes(messages[count - 1]), "New progress appears beside all accepted earlier translations");
+    service.complete(service.posts[count - 1]);
+    page.poll(1000);
+    const translated = messages.slice(0, count).map((_, index) => `当前任务第${index + 1}段译文。`).join("\n\n");
+    await settle(() => page.elements.get("reply-text").textContent === translated, "Cumulative progress translated without dropping earlier messages");
+  }
+  assert(service.posts.every(payload => payload.action === "translate_reply"));
+}
+
+async function latePreviousUserTurnCannotCarryOverWithinTheSameContext() {
+  class TurnService extends StreamService {
+    constructor() { super("queued"); this.nativeTurn = "1".repeat(64); }
+    state() {
+      const state = super.state();
+      return {...state, reply: {...state.reply, scope: "current_turn", turn_id: this.nativeTurn}};
+    }
+  }
+  const service = new TurnService();
+  const page = browser(service, new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]));
+  await settle(() => service.posts.length === 1, "Previous user turn translation queued");
+  const previous = {incremental: true, context: service.nativeContext, turn_id: service.nativeTurn,
+    translation_revision: service.translationRevision, connection_revision: service.connectionRevision,
+    source: service.nativeText, source_hash: service.posts[0].source_hash, translated_source: service.nativeText,
+    translated_text: "上一个用户任务的译文。", complete: true, next_ready: false, generating: true};
+  service.nativeTurn = "2".repeat(64);
+  service.nativeText += "\n\nNew user task progress is now current.";
+  page.poll(5000);
+  await settle(() => page.elements.get("reply-text").textContent === service.nativeText, "New user turn state");
+  service.complete(service.posts[0], previous);
+  page.poll(1000);
+  await settle(() => service.posts.length === 2, "New user turn queues its own reply translation");
+  assert.equal(page.elements.get("reply-text").textContent, service.nativeText);
+  assert(!page.elements.get("reply-text").textContent.includes("上一个用户任务"));
+}
+
 (async () => {
   await slowPostDoesNotStopPolling();
   await immediateCachedResultRenders();
@@ -528,6 +592,8 @@ async function liveReplyLateResultCannotReplaceAnotherContextAndReloadUsesOrigin
   await liveReplyProcessesMoreThanOneChunkForTheSameNativeSnapshot();
   await liveReplyFailureKeepsPaidRetryExplicitAcrossGrowth();
   await liveReplyLateResultCannotReplaceAnotherContextAndReloadUsesOriginalId();
+  await cumulativeCurrentTaskMessagesStayVisibleTogether();
+  await latePreviousUserTurnCannotCarryOverWithinTheSameContext();
   console.log("Mobile reply UI passed: latest empty/error states, delayed polling, cached/reloaded results, stable profile ID, effort revisions, late-result correlation, no instruction resubmission");
 })().catch(error => {
   console.error(error);

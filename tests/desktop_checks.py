@@ -95,10 +95,11 @@ with patch.object(d, "showing", side_effect=lambda node: node.visible):
     assert not d.code_approval_pending(dock, code_prompt)
     inline_approval.visible = True
     assert d.code_approval_pending(dock, code_prompt)
-    with patch.object(d, "document", return_value=(code_document, code_attrs)), patch.object(d, "app", return_value=application):
+    with patch.object(d, "document", return_value=(code_document, code_attrs)), patch.object(d, "app", return_value=application), \
+         patch.object(d, "current_turn_reply", side_effect=lambda panel, context: {**d.latest_reply(panel), "scope": "current_turn", "message_count": 1}):
         captured = d.dispatch({"action": "capture"})
     assert captured["mode"] == "Code"
-    assert captured["reply_count"] == 1 and captured["scope"] == "latest"
+    assert captured["reply_count"] == 1 and captured["scope"] == "current_turn"
     assert captured["text"].startswith("Latest Code reply")
     assert captured["code_blocks"] == ["git status\ngit diff"]
     assert all(value not in captured["text"] for value in ["Private user prompt", "Earlier reply", "Not now", "Hello world"])

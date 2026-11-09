@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import uuid
@@ -790,6 +791,7 @@ class Window(QMainWindow):
         self.capture_epoch = 0
         self.capture_pending = False
         self.reply_context = ""
+        self.reply_turn_id = ""
         self.pending_reply_context = ""
         self.current_target_title = ""
         self.current_target_host = ""
@@ -965,7 +967,7 @@ class Window(QMainWindow):
         self.terminal = QPlainTextEdit()
         self.terminal.setObjectName("terminal")
         self.terminal.setReadOnly(True)
-        self.terminal.setPlaceholderText("当前对话的最新回复会显示在这里。拖动上方分隔条调整阅读区高度。")
+        self.terminal.setPlaceholderText("当前任务的回复内容会显示在这里。拖动上方分隔条调整阅读区高度。")
         self.terminal.setMinimumHeight(50)
         reply.addWidget(self.terminal, 1)
         self.controls += [self.refresh_button, self.enter, self.attachment_list]
@@ -1325,7 +1327,7 @@ class Window(QMainWindow):
         self.target_action.setText(menu_text(f"当前目标：{self.config['ssh']['host']} · {title}"))
         self.capture_epoch += 1
         self.pending_reply_context = context
-        self.reply_read_status = "正在读取最后一条回复…"
+        self.reply_read_status = "正在读取当前任务回复…"
         self.reply_read_error = ""
         if result.get("switched") or self.reply_context != context:
             self.last_fingerprint = None
@@ -1354,7 +1356,7 @@ class Window(QMainWindow):
         self.reply_read_status = "正在匹配当前对话…"
         self.reply_read_error = ""
         self.render_reply()
-        self.terminal.setPlaceholderText("正在匹配 Ubuntu 当前对话并读取最新回复…")
+        self.terminal.setPlaceholderText("正在匹配 Ubuntu 当前对话并读取当前任务回复…")
 
         def done(result):
             if target != self.config["ssh"]:
@@ -1631,7 +1633,7 @@ class Window(QMainWindow):
             self.reply_read_failed(str(exc), expected_context)
             self.statusBar().showMessage(str(exc))
             return
-        self.reply_read_status = "正在读取最后一条回复…"
+        self.reply_read_status = "正在读取当前任务回复…"
         self.reply_read_error = ""
         if not self.reply_original:
             self.terminal.setPlaceholderText(self.reply_read_status)
@@ -1685,7 +1687,7 @@ class Window(QMainWindow):
             self.pending_reply_context = ""
         self.reply_read_status = "读取未完成，保留上次回复" if self.reply_original else "读取未完成，请重试"
         self.reply_read_error = message
-        self.terminal.setPlaceholderText("最后一条回复读取未完成：" + message)
+        self.terminal.setPlaceholderText("当前任务回复读取未完成：" + message)
         self.render_reply()
 
     def flush_pending_capture(self):
@@ -1706,7 +1708,7 @@ class Window(QMainWindow):
             self.reply_config_error = str(exc)
             revision = "invalid:" + json.dumps({name: profile.get(name, "") for name in
                 ("kind", "base_url", "model", "protocol", "reasoning_effort", "codex_path")}, sort_keys=True)
-        scope = json.dumps([self.config["ssh"]["host"], self.reply_context, pid,
+        scope = json.dumps([self.config["ssh"]["host"], self.reply_context, self.reply_turn_id, pid,
                             revision], ensure_ascii=False)
         self.reply_stream.sync(self.reply_original, generating=self.reply_generating,
                                scope=scope, code_blocks=self.reply_code_blocks)
@@ -1771,13 +1773,15 @@ class Window(QMainWindow):
         self.reply_heading.setText("Claude Code 回复" if result.get("mode") == "Code" else "Claude 回复")
         if result.get("context"):
             self.reply_context = result["context"]
+        turn_id = result.get("turn_id", "")
+        self.reply_turn_id = turn_id if isinstance(turn_id, str) and re.fullmatch(r"[0-9a-f]{64}", turn_id) else ""
         self.reply_original = result.get("text", "").rstrip("\r\n")
         self.reply_code_blocks = [x for x in result.get("code_blocks", []) if isinstance(x, str)]
         self.reply_generating = bool(result.get("generating", False))
         self.reply_read_error = ""
         self.reply_read_status = "" if self.reply_original else result.get("read_reason") or (
-            "Claude 正在生成最后一条回复，暂未返回正文…" if self.reply_generating else "当前会话暂未读到 Claude 回复。")
-        self.terminal.setPlaceholderText(self.reply_read_status or "只显示当前会话最后一条 Claude 回复。拖动上方分隔条调整阅读区高度。")
+            "Claude 正在处理当前任务，暂未返回正文…" if self.reply_generating else "当前会话暂未读到 Claude 回复。")
+        self.terminal.setPlaceholderText(self.reply_read_status or "显示当前任务的回复和新增内容。拖动上方分隔条调整阅读区高度。")
         self.render_reply()
         self.maybe_translate_reply()
 

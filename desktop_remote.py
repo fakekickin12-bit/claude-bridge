@@ -12,6 +12,7 @@ import select
 import subprocess
 import sys
 import shutil
+import stat
 import tempfile
 import time
 from collections import Counter
@@ -20,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -1028,7 +1029,7 @@ def message_feed(node, role=None, attrs=None):
             or role in {"panel", "landmark"} and node.name == "Chat messages")
 
 
-def reply_metadata_nodes(root, *, reverse=False, prune_feeds=False, limit=REPLY_CONTAINER_LIMIT):
+def reply_metadata_nodes(root, *, reverse=False, prune_feeds=False, limit=REPLY_CONTAINER_LIMIT, turn_boundaries=False):
     """Bounded structural reads; message articles and semantic bodies are never expanded."""
     remaining = [limit]
 
@@ -1040,7 +1041,9 @@ def reply_metadata_nodes(root, *, reverse=False, prune_feeds=False, limit=REPLY_
             raise ReplyReadLimit("当前消息列表结构较复杂，未读取历史正文；请稍后重试最后一条回复。")
         role, attrs = node.getRoleName(), node_attributes(node)
         yield node, role, attrs
-        if (role == "article" or "group/message-row" in attrs.get("class", "").split()
+        classes = attrs.get("class", "").split()
+        user_bubble = "group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes
+        if (role == "article" or "group/message-row" in classes or turn_boundaries and user_bubble
                 or role in REPLY_BODY_ROLES or role in {
                 "push button", "toggle button", "entry", "menu", "menu item", "tool bar"}
                 or "sr-only" in attrs.get("class", "").split()
@@ -1178,6 +1181,239 @@ def latest_reply(page):
         return {**empty, "read_status": "unavailable", "read_reason": str(exc)}
     except Exception:
         return {**empty, "read_status": "unavailable", "read_reason": "最后一条回复读取未完成，请稍后刷新。"}
+
+
+TURN_MESSAGE_LIMIT = 128
+TURN_METADATA_LIMIT = 1500
+TURN_TEXT_LIMIT = 120000
+TURN_CACHE_LIMIT = 2_000_000
+TURN_SECONDS = 24
+TURN_LOCK_SECONDS = 8
+
+
+def accessible_key(node):
+    """Native D-Bus object identity, not an index or a guessed content match."""
+    value = getattr(node, "path", None)
+    if not isinstance(value, str) or not re.fullmatch(r"/org/a11y/atspi/accessible/[A-Za-z0-9_/-]+", value):
+        raise ReplyReadLimit("客户端暂未提供稳定消息标记，请稍后刷新当前回复。")
+    return value
+
+
+def turn_article_speaker(article):
+    """Classify native speaker metadata without traversing either speaker's body."""
+    headings = []
+    remaining = [32]
+
+    def identify(node, depth):
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 5:
+            return None
+        role, attrs = node.getRoleName(), node_attributes(node)
+        classes = attrs.get("class", "").split()
+        if "group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes:
+            return "user"
+        if "group/message-row" in classes:
+            return "assistant"
+        if role == "heading" and "sr-only" in classes:
+            headings.append(node)
+            return None
+        if role in REPLY_BODY_ROLES or role in {"push button", "toggle button", "entry", "tool bar", "status bar"}:
+            return None
+        for index in range(min(node.childCount, 32)):
+            found = identify(node.getChildAtIndex(index), depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    speaker = identify(article, 0)
+    labels = [heading.name for heading in headings]
+    if speaker is None:
+        if any(label in {"You said", "You asked"} or label.startswith(("You said:", "You asked:")) for label in labels):
+            speaker = "user"
+        elif any(label in {"Claude responded", "Claude said"} or label.startswith(("Claude responded:", "Claude said:")) for label in labels):
+            speaker = "assistant"
+    label_hash = hashlib.sha256(json.dumps(labels, ensure_ascii=False).encode()).hexdigest()
+    return speaker, label_hash
+
+
+def current_turn_snapshot(page, context):
+    """Read reverse structural metadata only, stopping at the newest native human message."""
+    feeds = [node for node, role, attrs in reply_metadata_nodes(page, reverse=True, prune_feeds=True)
+             if message_feed(node, role, attrs)]
+    if len(feeds) != 1:
+        raise ReplyReadLimit("当前会话的消息列表尚未载入，请稍后刷新。")
+    feed = feeds[0]
+    feed_key = accessible_key(feed)
+    rows, anchor = [], None
+    for node, role, attrs in reply_metadata_nodes(feed, reverse=True, limit=TURN_METADATA_LIMIT, turn_boundaries=True):
+        classes = attrs.get("class", "").split()
+        is_user = "group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes
+        direct_row = "group/message-row" in classes
+        label_hash = ""
+        if role == "article":
+            speaker, label_hash = turn_article_speaker(node)
+            if speaker is None:
+                raise ReplyReadLimit("当前消息的归属尚未确认，请稍后刷新本轮回复。")
+            is_user = speaker == "user"
+            direct_row = speaker == "assistant"
+        if is_user:
+            anchor = [accessible_key(node), label_hash]
+            break
+        if not direct_row:
+            continue
+        if role != "article" and not direct_reply_payload(node):
+            continue
+        key = accessible_key(node)
+        signature = hashlib.sha256(json.dumps([key, role, node.childCount, attrs.get("id", ""), attrs.get("tag", "")]).encode()).hexdigest()
+        rows.append({"id": key, "signature": signature, "node": node})
+        if len(rows) > TURN_MESSAGE_LIMIT:
+            raise ReplyReadLimit("本轮回复较多，尚未完整确认消息顺序；请稍后刷新，不会跳过中间内容。")
+    if anchor is None:
+        if rows:
+            raise ReplyReadLimit("本轮用户消息尚未载入，无法确认回复起点；请在 Ubuntu 显示当前对话后刷新。")
+        return {"turn_id": "", "feed_id": feed_key, "rows": []}
+    turn_id = hashlib.sha256(json.dumps([context, feed_key, anchor], ensure_ascii=False).encode()).hexdigest()
+    rows.reverse()
+    if len({row["id"] for row in rows}) != len(rows):
+        raise ReplyReadLimit("当前消息标记不唯一，请稍后刷新本轮回复。")
+    return {"turn_id": turn_id, "feed_id": feed_key, "rows": rows}
+
+
+def turn_cache_directory():
+    directory = ROOT / "reply-cursors"
+    if ROOT.is_symlink() or directory.is_symlink():
+        raise DesktopError("回复缓存目录不安全，未读取缓存。")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if directory.stat().st_uid != os.getuid():
+        raise DesktopError("回复缓存目录不属于当前用户。")
+    directory.chmod(0o700)
+    return directory
+
+
+def read_turn_cache(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return {}
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > TURN_CACHE_LIMIT:
+            raise DesktopError("回复缓存文件不安全，未读取缓存。")
+        data = stream.read(TURN_CACHE_LIMIT + 1)
+    try:
+        value = json.loads(data)
+        rows = value.get("rows", [])
+        if (value.get("schema") != 1 or not isinstance(rows, list) or len(rows) > TURN_MESSAGE_LIMIT
+                or any(not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                       or not isinstance(row.get("signature"), str) or not isinstance(row.get("text"), str)
+                       or not isinstance(row.get("code_blocks"), list)
+                       or any(not isinstance(block, str) for block in row["code_blocks"]) for row in rows)
+                or sum(len(row["text"]) + sum(map(len, row["code_blocks"])) for row in rows) > 2 * TURN_TEXT_LIMIT):
+            return {}
+        return value
+    except (ValueError, TypeError, AttributeError):
+        return {}
+
+
+def write_turn_cache(directory, path, value):
+    raw = json.dumps(value, ensure_ascii=False).encode()
+    if len(raw) > TURN_CACHE_LIMIT:
+        raise ReplyReadLimit("本轮回复缓存达到上限，未跳过中间内容；请稍后刷新。")
+    descriptor, temporary = tempfile.mkstemp(dir=directory, prefix="capture-", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(raw)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    # Keep only a small number of this helper's owned context snapshots, not a chat archive.
+    owned = []
+    for candidate in directory.glob("*.json"):
+        if not re.fullmatch(r"[0-9a-f]{64}\.json", candidate.name) or candidate.is_symlink():
+            continue
+        info = candidate.stat()
+        if info.st_uid == os.getuid() and stat.S_ISREG(info.st_mode):
+            owned.append((info.st_mtime, candidate))
+    for _stamp, candidate in sorted(owned, reverse=True)[16:]:
+        if candidate != path:
+            candidate.unlink(missing_ok=True)
+
+
+def current_turn_reply(page, context):
+    """Accumulate current-turn rows, re-reading only the mutable tail and new rows."""
+    empty = {"text": "", "reply_count": 0, "message_count": 0, "code_blocks": [], "scope": "current_turn",
+             "turn_id": "", "read_status": "empty", "partial": False}
+    try:
+        if not isinstance(context, str) or not re.fullmatch(r"[0-9a-f]{64}", context):
+            raise DesktopError("当前会话身份尚未确认，未读取回复缓存。")
+        directory = turn_cache_directory()
+        cache_path, lock_path = directory / (context + ".json"), directory / (context + ".lock")
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "a+b") as lock:
+            info = os.fstat(lock.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise DesktopError("回复缓存锁不安全。")
+            os.fchmod(lock.fileno(), 0o600)
+            lock_deadline = time.monotonic() + TURN_LOCK_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= lock_deadline:
+                        raise ReplyReadLimit("当前回复正在读取，请稍后刷新。") from None
+                    time.sleep(.05)
+            snapshot = current_turn_snapshot(page, context)
+            saved = read_turn_cache(cache_path)
+            if not snapshot["turn_id"]:
+                if saved.get("context") == context and saved.get("rows"):
+                    raise ReplyReadLimit("本轮消息起点暂未载入，请在 Ubuntu 显示当前对话后刷新。")
+                return {**empty, "read_reason": "当前会话还没有本轮 Claude 回复。"}
+            rows = snapshot["rows"]
+            cached = saved.get("rows", []) if (saved.get("context") == context
+                     and saved.get("turn_id") == snapshot["turn_id"]) else []
+            aligned = bool(cached and len(cached) <= len(rows)
+                           and [row["id"] for row in cached] == [row["id"] for row in rows[:len(cached)]])
+            if cached and not aligned:
+                raise ReplyReadLimit("本轮消息有折叠、重排或尚未载入的部分，未跳过中间内容；请在 Ubuntu 显示完整本轮对话后刷新。")
+            reusable = bool(aligned
+                            and all(old["signature"] == new["signature"] for old, new in zip(cached[:-1], rows)))
+            start = max(0, len(cached) - 1) if reusable else 0
+            captured = [dict(row) for row in cached[:start]] if reusable else []
+            deadline = time.monotonic() + TURN_SECONDS
+            for row in rows[start:]:
+                if time.monotonic() > deadline and len(captured) > start:
+                    break
+                body, code = latest_reply_content(row["node"])
+                captured.append({"id": row["id"], "signature": row["signature"], "text": body, "code_blocks": code})
+                if sum(len(item["text"]) for item in captured) > TURN_TEXT_LIMIT:
+                    raise ReplyReadLimit("本轮回复文字达到读取上限，未跳过中间内容。")
+            after = current_turn_snapshot(page, context)
+            # Persist only a verified ordered prefix when a large turn needs more than one poll.
+            # The next poll refreshes this prefix's mutable tail, then continues immediately after it.
+            ids = [row["id"] for row in rows[:len(captured)]]
+            later_ids = [row["id"] for row in after["rows"]]
+            if after["turn_id"] != snapshot["turn_id"] or later_ids[:len(ids)] != ids:
+                raise ReplyReadLimit("本轮消息已变化，请刷新重新确认顺序。")
+            if any(old["signature"] != new["signature"] for old, new in zip(rows[:len(captured) - 1], after["rows"])):
+                raise ReplyReadLimit("本轮较早消息的结构正在变化，请刷新重新确认内容。")
+            partial = (len(later_ids) != len(ids)
+                       or bool(ids and rows[len(ids) - 1]["signature"] != after["rows"][len(ids) - 1]["signature"]))
+            confirm_page_context(context)
+            write_turn_cache(directory, cache_path, {"schema": 1, "context": context, "turn_id": snapshot["turn_id"],
+                                                     "rows": captured, "updated_at": time.time()})
+            body = "\n\n".join(row["text"] for row in captured if row["text"])
+            blocks = [block for row in captured for block in row["code_blocks"]]
+            count = sum(bool(row["text"]) for row in captured)
+            return {**empty, "text": body, "code_blocks": blocks, "reply_count": count, "message_count": count,
+                    "turn_id": snapshot["turn_id"], "read_status": "ready" if body else "empty", "partial": partial,
+                    "read_reason": "已读取本轮连续回复，下一次继续补齐。" if partial else "" if body else "等待 Claude 输出本轮回复。"}
+    except (ReplyReadLimit, DesktopError) as exc:
+        return {**empty, "read_status": "unavailable", "read_reason": str(exc)}
+    except Exception:
+        return {**empty, "read_status": "unavailable", "read_reason": "本轮回复读取未完成，请稍后刷新。"}
 
 
 def reply_in_progress(page):
@@ -1666,6 +1902,7 @@ def desktop_executable(request):
     return executable.resolve()
 
 
+
 def launch_client(request):
     executable = desktop_executable(request)
     env = environment()
@@ -1768,7 +2005,7 @@ def dispatch(request):
         if is_code:
             page = code_panel(page)
         route = urlsplit(attrs["URI"]).path
-        reply = latest_reply(page)
+        reply = current_turn_reply(page, context)
         if reply.get("read_status") == "unavailable" and (CODE_LOCAL_SESSION.fullmatch(route)
                 or re.fullmatch(r"/chat/[0-9a-f-]{36}/?", route, re.IGNORECASE)):
             raise DesktopError(reply.get("read_reason") or "当前会话的最后一条回复尚未载入，请稍后刷新。")

@@ -54,7 +54,7 @@
       </div>
       <button id="new-button" type="button" class="secondary new-button">新建对话</button>
       <div class="project-navigation" role="group" aria-label="Ubuntu 项目与会话">
-        <button id="match-current-button" type="button" class="secondary" title="读取 Ubuntu 当前打开的 Claude Code 会话和最新回复，保留草稿与附件">匹配当前对话</button>
+        <button id="match-current-button" type="button" class="secondary" title="读取 Ubuntu 当前打开的 Claude Code 会话和当前任务回复，保留草稿与附件">匹配当前对话</button>
         <button id="projects-button" type="button" class="secondary" aria-controls="projects-panel" aria-expanded="false">切换项目</button>
         <section id="projects-panel" class="projects-panel" aria-label="选择项目与会话" hidden>
           <div class="projects-toolbar"><p id="projects-status" class="muted" role="status"></p><button id="projects-refresh-button" type="button" class="text-button">刷新项目</button></div>
@@ -111,7 +111,7 @@
       <section id="reply-panel" class="reply-panel" aria-label="Claude 回复">
         <div class="panel-heading"><h2 id="reply-heading">Claude 回复</h2><div class="reply-actions"><button id="translate-reply-button" type="button" class="toggle-button" aria-pressed="false" title="开启后使用当前翻译连接的额度">自动翻译</button><button id="refresh-button" type="button" class="icon-button" aria-label="刷新回复" title="刷新回复"><svg><use href="#refresh-icon"/></svg></button></div></div>
         <p id="reply-status" class="reply-status muted" aria-live="polite"></p>
-        <div class="reply-body" tabindex="0"><pre id="reply-text"></pre><p id="reply-empty" class="reply-empty">当前会话的最新回复会显示在这里。</p></div>
+        <div class="reply-body" tabindex="0"><pre id="reply-text"></pre><p id="reply-empty" class="reply-empty">当前任务的回复内容会显示在这里。</p></div>
         <div class="reply-foot"><span id="reply-updated" class="muted"></span><span class="muted">每 5 秒刷新</span></div>
       </section>
 

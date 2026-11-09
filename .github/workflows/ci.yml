@@ -54,6 +54,7 @@ jobs:
         run: |
           python tests/desktop_checks.py
           python tests/desktop_latest_checks.py
+          python tests/desktop_turn_checks.py
           python tests/desktop_capture_checks.py
           python tests/desktop_projects_checks.py
           python tests/desktop_match_checks.py

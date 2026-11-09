@@ -189,3 +189,91 @@ def test_cached_prefix_rewrite_and_scope_guards_match_normal_chunks():
     assert stream.seed_cached({"text": "已改回复。"})
     stream.sync(stream.source, False, "two")
     assert stream.consumed == 0
+
+
+def test_current_turn_progress_rows_drain_in_order_when_later_rows_arrive_inflight():
+    # Native capture joins assistant progress rows from the same current user
+    # turn. New rows append to this source even when tool rows sit between them.
+    # Each row fits a chunk, but two rows together exceed the normal chunk cap.
+    rows = [f"Progress {number}: " + (f"detail{number} " * 48) + "This update is complete."
+            for number in range(1, 5)]
+    stream = IncrementalReply().sync(rows[0], True, "same-task/profile")
+    sources = []
+    first = stream.next_chunk()
+    assert first["source"] == rows[0]
+    sources.append(first["raw_source"])
+    assert stream.accept(first, {"text": "进度1"})
+
+    stream.sync("\n\n".join(rows[:2]), True, "same-task/profile")
+    second = stream.next_chunk()
+    assert second["source"] == rows[1]
+    # The second model call is still running when progress rows 3 and 4 arrive.
+    stream.sync("\n\n".join(rows), True, "same-task/profile")
+    sources.append(second["raw_source"])
+    assert stream.accept(second, {"text": "进度2"})
+    for number in (3, 4):
+        chunk = stream.next_chunk()
+        assert chunk["source"] == rows[number - 1]
+        assert chunk["offset"] == sum(map(len, sources))
+        sources.append(chunk["raw_source"])
+        assert stream.accept(chunk, {"text": f"进度{number}"})
+    assert "".join(sources) == "\n\n".join(rows)
+    assert stream.render() == "\n\n".join(f"进度{number}" for number in range(1, 5))
+    assert stream.complete and stream.next_chunk() is None
+
+
+def test_current_turn_short_completed_rows_can_batch_without_skipping_middle():
+    rows = [f"Progress {number}: the completed update is available." for number in range(1, 5)]
+    source = "\n\n".join(rows[:3])
+    stream = IncrementalReply().sync(source, True, "same-task/profile")
+    batch = stream.next_chunk()
+    assert batch["offset"] == 0
+    assert batch["source"] == source
+    assert stream.accept(batch, {"text": "进度1\n\n进度2\n\n进度3"})
+    stream.sync("\n\n".join(rows), True, "same-task/profile")
+    last = stream.next_chunk()
+    assert last["offset"] == len(source)
+    assert last["source"] == rows[3]
+    assert stream.accept(last, {"text": "进度4"})
+    assert stream.render() == "进度1\n\n进度2\n\n进度3\n\n进度4"
+
+
+def test_current_turn_new_rows_do_not_advance_past_unaccepted_earlier_content():
+    first = "The earlier progress update is complete."
+    later = "A newer progress update has now appeared."
+    stream = IncrementalReply().sync(first, True, "same-task/profile")
+    pending = stream.next_chunk()
+    stream.sync(first + "\n\n" + later, True, "same-task/profile")
+    retry_or_batch = stream.next_chunk()
+    assert stream.consumed == 0
+    assert retry_or_batch["offset"] == pending["offset"] == 0
+    assert retry_or_batch["source"].startswith(first)
+    assert stream.render() == first + "\n\n" + later
+
+
+def test_current_turn_row_boundary_flushes_earlier_prose_before_newer_rows():
+    first = "Earlier progress without a final punctuation mark"
+    stream = IncrementalReply().sync(first, True, "same-task/profile")
+    assert stream.next_chunk() is None
+    later = "A later complete assistant progress update."
+    stream.sync(first + "\n\n" + later, True, "same-task/profile")
+    chunk = stream.next_chunk()
+    # Batching is allowed, but a later complete sentence cannot jump over the
+    # preceding row simply because that row lacked sentence punctuation.
+    assert chunk["offset"] == 0
+    assert chunk["source"].startswith(first)
+    assert first in chunk["source"] and later in chunk["source"]
+
+
+def test_current_turn_old_row_rewrite_rejects_newer_row_pending_result():
+    first = "The first assistant progress update is complete."
+    second = "The second assistant progress update is complete."
+    stream = IncrementalReply().sync(first, True, "same-task/profile")
+    accept_next(stream, "第一条进度。")
+    stream.sync(first + "\n\n" + second, True, "same-task/profile")
+    pending_second = stream.next_chunk()
+    revised = first.replace("first", "revised first")
+    stream.sync(revised + "\n\n" + second, True, "same-task/profile")
+    assert stream.consumed == 0
+    assert not stream.accept(pending_second, {"text": "不应跳过改写后的第一条"})
+    assert stream.next_chunk()["source"].startswith(revised)
