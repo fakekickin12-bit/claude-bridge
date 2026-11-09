@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#edf3f8">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>Claude Bridge</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="paperclip" viewBox="0 0 24 24"><path d="m8.5 12.5 6.6-6.6a3.2 3.2 0 0 1 4.5 4.5l-9.2 9.2a5.2 5.2 0 0 1-7.3-7.3l9.2-9.2a2.2 2.2 0 0 1 3.1 3.1l-9.2 9.2a.9.9 0 0 0 1.3 1.3l7.9-7.9"/></symbol>
+    <symbol id="refresh-icon" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M5.6 7a7.5 7.5 0 0 1 12-2L20 8M4 16l2.4 3a7.5 7.5 0 0 0 12-2"/></symbol>
+    <symbol id="close-icon" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></symbol>
+  </svg>
+
+  <main id="login-view" class="login-view" hidden>
+    <form id="login-form" class="login-form">
+      <div class="brand-mark" aria-hidden="true">B</div>
+      <h1>Claude Bridge</h1>
+      <h2>登记此设备</h2>
+      <p class="login-description">配对码由 Windows 生成。登记后，此浏览器会自动登录。清除浏览器数据或更换浏览器后，需要重新登记。</p>
+      <label for="device-label">设备名称</label>
+      <input id="device-label" name="label" type="text" maxlength="80" autocomplete="off" placeholder="例如，我的 iPhone 或我的 iPad" required>
+      <label for="pairing-code">一次性配对码</label>
+      <input id="pairing-code" name="code" type="text" maxlength="200" autocomplete="one-time-code" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+      <button id="login-button" type="submit" class="primary">登记并进入</button>
+      <p id="login-error" class="error-text" role="alert"></p>
+    </form>
+  </main>
+
+  <div id="app-view" class="app-view" hidden>
+    <header class="app-header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">B</span><h1>Claude Bridge</h1></div>
+      <div class="header-actions"><span id="connection-state" class="connection-state"><span class="status-dot"></span>正在连接</span><button id="logout-button" class="text-button" type="button" title="撤销此浏览器的设备凭证，重新进入需要新的配对码">撤销本设备</button></div>
+    </header>
+
+    <div class="mobile-menu-bar"><button id="mobile-menu-button" type="button" class="mobile-menu-button" aria-controls="connection-panel" aria-expanded="false">菜单<span class="menu-chevron" aria-hidden="true"></span></button></div>
+    <section id="connection-panel" class="connection-strip" aria-label="连接设置">
+      <div class="profile-field" role="group" aria-label="翻译连接">
+        <label for="profile-select">翻译连接</label>
+        <select id="profile-select"></select>
+        <span id="profile-model" class="muted"></span>
+      </div>
+      <div class="target-field">
+        <div class="target-heading"><span class="field-label">Ubuntu 当前会话</span><span id="target-state" class="status-pill">正在读取</span></div>
+        <p id="target-title" class="target-title">正在读取目标会话</p>
+        <p id="target-detail" class="muted"></p>
+      </div>
+      <button id="new-button" type="button" class="secondary new-button">新建对话</button>
+      <div class="project-navigation" role="group" aria-label="Ubuntu 项目与会话">
+        <button id="match-current-button" type="button" class="secondary" title="读取 Ubuntu 当前打开的 Claude Code 会话和最新回复，保留草稿与附件">匹配当前对话</button>
+        <button id="projects-button" type="button" class="secondary" aria-controls="projects-panel" aria-expanded="false">切换项目</button>
+        <section id="projects-panel" class="projects-panel" aria-label="选择项目与会话" hidden>
+          <div class="projects-toolbar"><p id="projects-status" class="muted" role="status"></p><button id="projects-refresh-button" type="button" class="text-button">刷新项目</button></div>
+          <label for="project-select">项目</label>
+          <select id="project-select"><option value="">请选择项目</option></select>
+          <div id="session-picker" class="session-picker" hidden>
+            <label for="session-select">本项目的其他会话</label>
+            <select id="session-select"><option value="">请选择要进入的会话</option></select>
+            <button id="enter-session-button" type="button" class="secondary" disabled>进入会话</button>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <nav class="mobile-tabs" aria-label="工作区" role="tablist">
+      <button type="button" role="tab" data-tab="compose" aria-controls="compose-panel" aria-selected="true">写指令</button>
+      <button type="button" role="tab" data-tab="reply" aria-controls="reply-panel" aria-selected="false">Claude 回复<span id="reply-new" class="new-dot" hidden></span></button>
+      <button type="button" role="tab" data-tab="history" aria-controls="history-panel" aria-selected="false">发送记录</button>
+    </nav>
+
+    <section id="update-banner" class="update-banner" role="status" hidden>
+      <div><strong>发现新版本</strong><p id="update-description">草稿和本次操作记录会保留在此浏览器。</p></div>
+      <button id="update-page-button" type="button" class="secondary">更新页面</button>
+    </section>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <section id="request-recovery" class="request-recovery" aria-label="恢复本次操作" hidden>
+      <p id="recovery-description"></p>
+      <div><button id="retry-request-button" type="button" class="secondary">重试原请求</button><button id="abandon-request-button" type="button" class="text-button">已查看 Ubuntu，结束跟踪</button></div>
+    </section>
+
+    <main class="workspace" data-active-tab="compose">
+      <section id="compose-panel" class="compose-panel" aria-label="指令编辑">
+        <div class="editor-grid">
+          <div class="editor-field">
+            <div class="editor-heading"><label for="source">你的中文指令</label><button id="attach-button" type="button" class="icon-button" aria-label="载入附件" title="载入附件"><svg><use href="#paperclip"/></svg></button></div>
+            <textarea id="source" placeholder="输入要交给 Ubuntu Claude 的指令" spellcheck="false"></textarea>
+          </div>
+          <div class="editor-field">
+            <div class="editor-heading"><label for="english">交给 Claude 的英文稿</label><span id="draft-state" class="draft-state"></span></div>
+            <textarea id="english" placeholder="翻译结果会显示在这里，也可以直接编辑英文稿" lang="en" spellcheck="false"></textarea>
+          </div>
+        </div>
+
+        <input id="file-input" type="file" multiple hidden>
+        <ul id="attachment-list" class="attachment-list" aria-label="本次附件"></ul>
+        <p id="attachment-hint" class="attachment-hint muted" hidden></p>
+        <div class="compose-actions">
+          <div class="send-buttons"><button id="translate-button" type="button" class="secondary">仅翻译</button><button id="send-button" type="button" class="secondary">发送英文稿</button><button id="translate-send-button" type="button" class="primary">翻译并发送</button></div>
+          <label class="checkbox-label"><input id="auto-enter" type="checkbox" checked><span>载入后自动发送</span></label>
+        </div>
+        <div id="job-status" class="job-status" role="status" hidden><span id="job-spinner" class="spinner" aria-hidden="true"></span><div><strong id="job-title"></strong><p id="job-detail"></p><button id="checked-ubuntu-button" type="button" class="text-button" hidden>已查看 Ubuntu，继续编辑</button></div></div>
+      </section>
+
+      <section id="reply-panel" class="reply-panel" aria-label="Claude 回复">
+        <div class="panel-heading"><h2 id="reply-heading">Claude 回复</h2><div class="reply-actions"><button id="translate-reply-button" type="button" class="toggle-button" aria-pressed="false" title="开启后使用当前翻译连接的额度">自动翻译</button><button id="refresh-button" type="button" class="icon-button" aria-label="刷新回复" title="刷新回复"><svg><use href="#refresh-icon"/></svg></button></div></div>
+        <p id="reply-status" class="reply-status muted" aria-live="polite"></p>
+        <div class="reply-body" tabindex="0"><pre id="reply-text"></pre><p id="reply-empty" class="reply-empty">当前会话的最新回复会显示在这里。</p></div>
+        <div class="reply-foot"><span id="reply-updated" class="muted"></span><span class="muted">每 5 秒刷新</span></div>
+      </section>
+
+      <section id="history-panel" class="history-panel" aria-label="发送记录">
+        <div class="panel-heading"><h2>发送记录</h2><button id="history-refresh-button" type="button" class="text-button">刷新</button></div>
+        <ol id="history-list" class="history-list"></ol>
+        <p id="history-empty" class="empty-message">还没有发送记录。</p>
+      </section>
+    </main>
+    <footer class="app-footer"><span>文字翻译和回复翻译使用当前连接的额度。</span><span id="saved-state">草稿自动保存在此浏览器</span></footer>
+  </div>
+  <div id="startup-state" class="startup-state"><span class="spinner" aria-hidden="true"></span><span>正在连接 Claude Bridge</span></div>
+</body>
+</html>

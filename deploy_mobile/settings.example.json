@@ -1,0 +1,9 @@
+{
+  "public_origin": "",
+  "vps_host": "",
+  "vps_port": 22,
+  "admin_user": "root",
+  "admin_key": "~/.ssh/id_ed25519",
+  "known_hosts": "~/.ssh/known_hosts",
+  "bind_physical_interface": false
+}

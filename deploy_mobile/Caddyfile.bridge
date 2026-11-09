@@ -1,0 +1,26 @@
+bridge.example.com {
+    @wrong_host not host bridge.example.com
+    respond @wrong_host 421
+
+    @upload path /api/uploads
+    request_body @upload {
+        max_size 268500992
+    }
+    @small not path /api/uploads
+    request_body @small {
+        max_size 1048576
+    }
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000"
+    }
+    reverse_proxy 127.0.0.1:18770 {
+        header_up Host bridge.example.com
+        header_up X-Forwarded-Proto https
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 45s
+        }
+    }
+}

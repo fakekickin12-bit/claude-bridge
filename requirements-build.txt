@@ -1,0 +1,5 @@
+# Versions used for the downloadable Windows build.
+PySide6==6.9.1
+Pillow==12.3.0
+qrcode==8.2
+pyinstaller==6.17.0
