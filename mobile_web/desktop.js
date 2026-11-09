@@ -18,10 +18,12 @@
   ui["remote-text"].value = typeof restored.text === "string" ? restored.text : "";
   let csrf = "", authenticated = false, stopped = false;
   let frame = null, frameLoaded = false, frameBusy = false, inputBusy = false;
+  let manualFrame = false;
   let frameEpoch = 0, frameTimer = 0, imageGeneration = 0;
   let displayedImageHash = "", displayedWidth = 0, displayedHeight = 0;
   let scale = 0, tap = null, tapTimer = 0;
   let viewportBaseline = window.innerHeight || 0;
+  let pureMode = false, pureNative = false, pureRestore = null, exitGesture = null;
   let pinch = null, gesture = false;
   const pointers = new Map();
 
@@ -34,7 +36,7 @@
   }
 
   function notice(message, error = false) {
-    ui.notice.textContent = message;
+    if (ui.notice.textContent !== message) ui.notice.textContent = message;
     ui.notice.classList.toggle("error", error);
   }
 
@@ -51,16 +53,22 @@
     ui["send-key"].disabled = !ready;
     ui["extra-key"].disabled = !ready;
     for (const button of keyButtons) button.disabled = !ready;
-    ui.refresh.disabled = !visible() || !authenticated || frameBusy;
+    const refreshDisabled = !visible() || !authenticated || manualFrame;
+    if (ui.refresh.disabled !== refreshDisabled) ui.refresh.disabled = refreshDisabled;
+    const refreshText = manualFrame ? "刷新中…" : "刷新";
+    if (ui.refresh.textContent !== refreshText) ui.refresh.textContent = refreshText;
+    if (ui.refresh.getAttribute("aria-busy") !== String(manualFrame)) ui.refresh.setAttribute("aria-busy", String(manualFrame));
     ui["query-input"].hidden = !pending?.unknown;
     ui["query-input"].disabled = !visible() || !authenticated || inputBusy;
-    ui.connection.textContent = authenticated ? pending ? "操作待确认" : fresh() && frameLoaded ? "已连接" : "读取画面" : "未连接";
+    const connectionText = authenticated ? pending ? "操作待确认" : fresh() && frameLoaded ? "已连接" : "读取画面" : "未连接";
+    if (ui.connection.textContent !== connectionText) ui.connection.textContent = connectionText;
     ui.connection.classList.toggle("online", authenticated && frameLoaded && fresh());
     ui.connection.classList.toggle("offline", !authenticated);
   }
 
   function requireLogin(message) {
     authenticated = false;
+    manualFrame = false;
     frameLoaded = false;
     clearTimeout(frameTimer);
     ui["login-required"].hidden = false;
@@ -140,7 +148,75 @@
       root.classList.toggle("keyboard-open", keyboard);
       root.classList.toggle("keyboard-compact", keyboard && height < 300);
     }
+    if (root.style && pureMode) {
+      root.style.setProperty("--pure-height", `${Math.round(view?.height || window.innerHeight)}px`);
+      root.style.setProperty("--pure-width", `${Math.round(view?.width || window.innerWidth)}px`);
+      root.style.setProperty("--pure-top", `${Math.round(Math.max(0, view?.offsetTop || 0))}px`);
+      root.style.setProperty("--pure-left", `${Math.round(Math.max(0, view?.offsetLeft || 0))}px`);
+    }
     layoutImage();
+  }
+
+  function fullscreenElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+
+  function clearTouches() {
+    cancelTap(); pointers.clear(); pinch = null; gesture = false; exitGesture = null;
+  }
+
+  function finishPureScreen() {
+    clearTouches();
+    pureMode = pureNative = false;
+    document.documentElement.classList.toggle("pure-screen", false);
+    if (pureRestore) {
+      scale = pureRestore.scale;
+      ui.zoom.value = pureRestore.zoom;
+      pureRestore = null;
+    }
+    syncViewport();
+  }
+
+  async function exitPureScreen() {
+    clearTouches();
+    if (fullscreenElement() === ui.viewport) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (exit) {
+        try { await exit.call(document); } catch (_) { return; }
+        if (fullscreenElement() === ui.viewport) return;
+      } else return;
+    }
+    finishPureScreen();
+  }
+
+  async function enterPureScreen() {
+    if (pureMode) { await exitPureScreen(); return; }
+    if (!authenticated || !frameLoaded || !fresh()) {
+      notice("请等桌面画面加载完成后再全屏。", true);
+      return;
+    }
+    ui["remote-text"].blur();
+    clearTouches();
+    pureRestore = {scale, zoom: ui.zoom.value};
+    scale = 0;
+    pureMode = true;
+    pureNative = false;
+    document.documentElement.classList.toggle("pure-screen", true);
+    syncViewport();
+    // Fullscreen only this image area. Unsupported/rejected Safari requests
+    // retain the pure-screen CSS view; browser chrome remains browser-owned.
+    const request = ui.viewport.requestFullscreen || ui.viewport.webkitRequestFullscreen || ui.viewport.webkitRequestFullScreen;
+    if (request) {
+      try {
+        await request.call(ui.viewport);
+        pureNative = fullscreenElement() === ui.viewport;
+      } catch (_) {}
+    }
+  }
+
+  function fullscreenChanged() {
+    if (fullscreenElement() === ui.viewport) {
+      pureNative = true;
+      syncViewport();
+    } else if (pureMode && pureNative) finishPureScreen();
   }
 
   async function readFrame() {
@@ -154,10 +230,10 @@
       if (!visible() || epoch !== frameEpoch) return;
       if (!validFrame(value)) throw new ApiError("画面已过期或格式无效，请刷新。");
       const generation = ++imageGeneration;
-      frameLoaded = false;
-      frame = value;
-      layoutImage();
-      if (value.unchanged === true) {
+      const sameImage = value.unchanged === true || (validFingerprint(value.image_hash) && value.image_hash === displayedImageHash &&
+        !ui.screen.hidden && value.width === displayedWidth && value.height === displayedHeight);
+      if (sameImage) {
+        frame = value;
         frameLoaded = true;
         if (!pending) notice("正在显示 Ubuntu 当前桌面。选择触控模式后操作。");
         controls();
@@ -169,12 +245,16 @@
           frameLoaded = false;
           notice("桌面画面尺寸不匹配，请刷新。", true);
         } else {
+          // Keep the last displayed frame usable while a changed JPEG decodes;
+          // update pixels and their input grant together, without a gray flash.
+          frame = value;
           frameLoaded = true;
           displayedImageHash = validFingerprint(value.image_hash) ? value.image_hash : "";
           displayedWidth = value.width;
           displayedHeight = value.height;
           ui.screen.hidden = false;
           ui["empty-frame"].hidden = true;
+          layoutImage();
           if (!pending) notice("正在显示 Ubuntu 当前桌面。选择触控模式后操作。");
         }
         controls();
@@ -206,9 +286,22 @@
       }
     } finally {
       frameBusy = false;
+      manualFrame = false;
       controls();
       scheduleFrame(epoch === frameEpoch ? frameLoaded ? 1000 : 2500 : 0);
     }
+  }
+
+  function refreshManually() {
+    if (!visible() || !authenticated || manualFrame) return;
+    cancelTap();
+    manualFrame = true;
+    controls();
+    // A user refresh can reuse an already running read. It never queues a
+    // duplicate screenshot request, nor affects the quiet background timer.
+    if (frameBusy) return;
+    clearTimeout(frameTimer);
+    return readFrame();
   }
 
   function imageRect(bounds, width, height) {
@@ -336,16 +429,23 @@
   }
 
   function pointerDown(event) {
-    if (!authenticated || !frameLoaded || !fresh()) return;
     const position = point(event.clientX, event.clientY);
-    if (!position) return;
-    pointers.set(event.pointerId, {clientX: event.clientX, clientY: event.clientY, position, frame: {...frame}, button: event.button});
+    if ((!authenticated || !frameLoaded || !fresh() || !position) && !pureMode) return;
+    pointers.set(event.pointerId, {clientX: event.clientX, clientY: event.clientY, position, frame: frame ? {...frame} : null, button: event.button});
+    if (pureMode && pointers.size === 3) {
+      cancelTap(); gesture = true; pinch = null;
+      exitGesture = {ids: new Set(pointers.keys()), positions: new Map([...pointers].map(([id, value]) => [id, {...value}])),
+        time: Date.now(), valid: true};
+      event.preventDefault();
+      return;
+    }
+    if (exitGesture) { exitGesture.valid = false; gesture = true; return; }
     if (pointers.size > 1) {
       cancelTap();
       gesture = true;
       const pair = [...pointers.values()];
-      const bounds = imageRect(ui.stage.getBoundingClientRect(), frame.width, frame.height);
-      pinch = {distance: Math.hypot(pair[0].clientX - pair[1].clientX, pair[0].clientY - pair[1].clientY), scale: scale || bounds.width / frame.width};
+      const bounds = frame ? imageRect(ui.stage.getBoundingClientRect(), frame.width, frame.height) : {width: 1};
+      pinch = {distance: Math.hypot(pair[0].clientX - pair[1].clientX, pair[0].clientY - pair[1].clientY), scale: scale || bounds.width / (frame?.width || 1)};
     } else gesture = false;
     if (ui["pointer-mode"].value !== "browse") {
       event.preventDefault();
@@ -355,6 +455,12 @@
 
   function pointerMove(event) {
     if (!pointers.has(event.pointerId)) return;
+    if (exitGesture) {
+      const start = exitGesture.positions.get(event.pointerId);
+      if (start && Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 12) exitGesture.valid = false;
+      event.preventDefault();
+      return;
+    }
     if (pointers.size > 1 && pinch && ui["pointer-mode"].value !== "browse") {
       const moving = pointers.get(event.pointerId);
       moving.currentX = event.clientX;
@@ -375,10 +481,23 @@
     const start = pointers.get(event.pointerId);
     pointers.delete(event.pointerId);
     if (!pointers.size) pinch = null;
+    if (exitGesture) {
+      const original = exitGesture.positions.get(event.pointerId);
+      if (original && Math.hypot(event.clientX - original.clientX, event.clientY - original.clientY) > 12) exitGesture.valid = false;
+      exitGesture.ids.delete(event.pointerId);
+      const done = !exitGesture.ids.size;
+      const shouldExit = done && exitGesture.valid && Date.now() - exitGesture.time < 650;
+      event.preventDefault();
+      if (done) {
+        clearTouches();
+        if (shouldExit) exitPureScreen();
+      }
+      return;
+    }
     if (!start || gesture || ui["pointer-mode"].value === "browse") return;
     event.preventDefault();
     const end = point(event.clientX, event.clientY, start.frame);
-    if (!end || !canInput()) return;
+    if (!start.position || !start.frame || !end || !canInput()) return;
     const mode = ui["pointer-mode"].value;
     const distance = Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY);
     if (mode === "drag" && distance > 6) {
@@ -397,7 +516,10 @@
   ui.viewport.addEventListener("pointerdown", pointerDown);
   ui.viewport.addEventListener("pointermove", pointerMove);
   ui.viewport.addEventListener("pointerup", pointerUp);
-  ui.viewport.addEventListener("pointercancel", event => { pointers.delete(event.pointerId); gesture = true; cancelTap(); });
+  ui.viewport.addEventListener("pointercancel", event => {
+    if (exitGesture) clearTouches();
+    else { pointers.delete(event.pointerId); gesture = true; cancelTap(); }
+  });
   ui.viewport.addEventListener("contextmenu", event => event.preventDefault());
   ui.viewport.addEventListener("wheel", event => {
     if (ui["pointer-mode"].value === "browse") return;
@@ -431,7 +553,7 @@
   for (const button of keyButtons) button.addEventListener("click", () => { cancelTap(); sendInput({kind: "key", key: button.dataset.key}); });
   ui["send-key"].addEventListener("click", () => { cancelTap(); sendInput({kind: "key", key: ui["extra-key"].value}); });
   ui["query-input"].addEventListener("click", queryInput);
-  ui.refresh.addEventListener("click", () => { cancelTap(); scheduleFrame(0); });
+  ui.refresh.addEventListener("click", refreshManually);
   ui.zoom.addEventListener("change", () => {
     if (ui.zoom.value !== "custom") scale = ui.zoom.value === "fit" ? 0 : Number(ui.zoom.value);
     cancelTap(); layoutImage();
@@ -448,22 +570,21 @@
     ui["desktop-tools"].hidden = !ui["desktop-tools"].hidden;
     ui["settings-toggle"].setAttribute("aria-expanded", String(!ui["desktop-tools"].hidden));
   });
-  ui.fullscreen.addEventListener("click", async () => {
-    try {
-      if (document.fullscreenElement) await document.exitFullscreen();
-      else if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
-      else notice("此浏览器暂不支持网页全屏，可横屏使用或添加到主屏幕。");
-    } catch (_) { notice("未能进入全屏，可横屏使用。"); }
+  ui.fullscreen.addEventListener("click", enterPureScreen);
+  document.addEventListener("fullscreenchange", fullscreenChanged);
+  document.addEventListener("webkitfullscreenchange", fullscreenChanged);
+  document.addEventListener("keydown", event => {
+    if (pureMode && event.key === "Escape") { event.preventDefault(); exitPureScreen(); }
   });
 
   document.addEventListener("visibilitychange", () => {
-    cancelTap(); pointers.clear();
+    clearTouches();
     if (document.hidden) clearTimeout(frameTimer);
     else if (authenticated) { controls(); scheduleFrame(0); }
   });
   window.addEventListener("pagehide", event => {
     stopped = true;
-    cancelTap(); pointers.clear(); pinch = null; gesture = false; clearTimeout(frameTimer); save();
+    clearTouches(); clearTimeout(frameTimer); save();
     if (authenticated && !event.persisted) {
       fetch("/api/desktop/close", {method: "POST", credentials: "same-origin", keepalive: true,
         headers: {"Content-Type": "application/json", "X-CSRF-Token": csrf}, body: JSON.stringify({viewer_id: viewerId})}).catch(() => {});
