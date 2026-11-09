@@ -958,6 +958,26 @@ def test_live_reply_translates_new_sentences_during_generation_and_flushes_tail(
     assert backend.remote.count("send") == 0
 
 
+def test_live_reply_assembled_cache_survives_restart_with_different_chunk_boundaries(backend):
+    first = "An early completed sentence was translated while the reply grew.\n\n"
+    tail = "The later tail arrives without a final punctuation mark"
+    initial = run(backend, live_reply(backend, first + "The later tail"))
+    assert initial["result"]["translated_source"] == first
+    finished_payload = live_reply(backend, first + tail, generating=False)
+    finished = run(backend, finished_payload)
+    assert finished["result"]["complete"]
+    assert [item[0] for item in backend.translator.reply_translations] == [first.strip(), tail]
+    restarted = mobile.MobileBridge(backend.directory, ssh_factory=backend.remote.client,
+                                   translator_factory=backend.translator.factory)
+    restarted.target = dict(backend.service.target)
+    restarted.reply = dict(backend.service.reply)
+    restarted.code_blocks = list(backend.service.code_blocks)
+    restored = restarted.translate_reply(finished_payload.model_dump())
+    assert restored["complete"] and restored["translated_text"] == finished["result"]["translated_text"]
+    assert len(backend.translator.reply_translations) == 2, "The full assembled disk cache avoids paying for a differently sized final chunk"
+    assert backend.remote.count("send") == 0
+
+
 def test_live_reply_accepts_growth_while_chunk_is_running_without_repeating_prefix(backend):
     first = "One completed sentence is ready for translation.\n\n"
     appended = "Another completed sentence arrives while translating."

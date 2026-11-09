@@ -634,12 +634,25 @@ class MobileBridge:
                     raise core.BridgeError("回复正文已改写，旧分段译文未显示。")
         with self.lock:
             next_ready = stream.next_chunk() is not None
-            return {"incremental": True, "context": context, "translation_revision": revision,
+            response = {"incremental": True, "context": context, "translation_revision": revision,
                     "connection_revision": connection_revision,
                     "source": stream.source, "source_hash": hashlib.sha256(stream.source.encode()).hexdigest(),
                     "text": stream.render(), "translated_source": stream.translated_source,
                     "translated_text": stream.translated_text, "complete": stream.complete,
                     "next_ready": next_ready, "generating": stream.generating}
+            # Persist the assembled reply as well as its chunks. After restart,
+            # a finished snapshot can have different boundaries from the earlier
+            # growing reads; it must not cause the same content to be paid again.
+            whole_snapshot = None
+            if (stream.complete and stream.source and stream.scope == scope
+                    and self.reply.get("context") == context and self.target.get("context") == context
+                    and self.reply.get("text") == stream.source and self.code_blocks == stream.code_blocks):
+                whole_snapshot = (translation_key(stream.source, profile, profile_id, stream.code_blocks),
+                                  stream.source, {"text": stream.render(),
+                                  "model": result.get("model", "") if chunk is not None else profile.get("model", "")})
+        if whole_snapshot:
+            self.reply_cache.put(*whole_snapshot)
+        return response
 
     def attachment_paths(self, identifiers):
         paths = []
