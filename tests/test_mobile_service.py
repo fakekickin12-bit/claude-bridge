@@ -599,6 +599,8 @@ def test_old_job_payload_without_new_session_signature_keeps_original_idempotenc
     payload = request()
     old = payload.model_dump()
     old.pop("session_catalog_id")
+    old.pop("incremental")
+    old.pop("connection_revision")
     encoded = json.dumps(old, sort_keys=True, ensure_ascii=False)
     with backend.service.database() as db:
         db.execute("INSERT INTO jobs(id,fingerprint,payload,state,phase,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
@@ -927,6 +929,137 @@ def test_reply_translation_rejects_partial_or_stale_reply(backend, generating, s
         payload = payload.model_copy(update={"source_hash": source_hash})
     assert run(backend, payload)["state"] == "failed"
     assert backend.translator.reply_translations == []
+
+
+def live_reply(backend, text, generating=True, context=CONTEXT):
+    backend.service.target = {"context": context, "ready": True, "mode": "Code"}
+    backend.service.accept_capture({"context": context, "text": text, "generating": generating, "mode": "Code"}, context)
+    connection = backend.service.public_state("synthetic-csrf")["connection_revision"]
+    return request("translate_reply", source_hash=backend.service.reply["source_hash"], incremental=True,
+                   expected_context=context, connection_revision=connection)
+
+
+def test_live_reply_translates_new_sentences_during_generation_and_flushes_tail(backend):
+    first = "First complete sentence for translation.\n\n"
+    tail = "Unfinished tail"
+    first_job = run(backend, live_reply(backend, first + tail))
+    value = first_job["result"]
+    assert first_job["state"] == "translated" and value["incremental"]
+    assert value["translated_source"] == first
+    assert value["text"] == "回复译文\n\n" + tail
+    assert value["generating"] and not value["next_ready"] and not value["complete"]
+    before = list(backend.translator.reply_translations)
+    repeated = run(backend, live_reply(backend, first + tail))
+    assert repeated["result"]["translated_source"] == first
+    assert backend.translator.reply_translations == before
+    final = run(backend, live_reply(backend, first + tail, generating=False))
+    assert final["result"]["complete"]
+    assert backend.translator.reply_translations == [(first.strip(), []), (tail, [])]
+    assert backend.remote.count("send") == 0
+
+
+def test_live_reply_accepts_growth_while_chunk_is_running_without_repeating_prefix(backend):
+    first = "One completed sentence is ready for translation.\n\n"
+    appended = "Another completed sentence arrives while translating."
+    payload = live_reply(backend, first)
+    original = backend.translator.translate_reply
+    def growing(text, *, code_blocks):
+        live_reply(backend, first + appended)
+        return original(text, code_blocks=code_blocks)
+    backend.translator.translate_reply = growing
+    result = run(backend, payload)
+    assert result["state"] == "translated"
+    assert result["result"]["translated_source"] == first.rstrip("\r\n")
+    assert result["result"]["source"] == first + appended
+    assert result["result"]["next_ready"]
+    backend.translator.translate_reply = original
+    following = run(backend, live_reply(backend, first + appended, generating=False))
+    assert following["result"]["complete"]
+    assert [item[0] for item in backend.translator.reply_translations] == [first.strip(), appended]
+
+
+@pytest.mark.parametrize("change", ["context", "rewrite", "connection"])
+def test_live_reply_rejects_late_wrong_page_or_rewritten_chunk(backend, change):
+    first = "A sufficiently long original sentence is ready."
+    payload = live_reply(backend, first)
+    original = backend.translator.translate_reply
+    def changed(text, *, code_blocks):
+        if change == "context":
+            live_reply(backend, "Different project reply.", context="b" * 64)
+        elif change == "rewrite":
+            live_reply(backend, "This native message was rewritten completely.")
+        else:
+            config = backend.service.config()
+            config["ssh"]["host"] = "another-synthetic-host"
+            core.atomic_json(backend.directory / "config.json", config)
+        return original(text, code_blocks=code_blocks)
+    backend.translator.translate_reply = changed
+    result = run(backend, payload)
+    assert result["state"] == "failed" and result["result"] is None
+    assert backend.remote.count("send") == 0
+
+
+def test_live_reply_failure_does_not_retry_growing_suffix_but_new_body_can_translate(backend):
+    first = "A complete sentence ready for live translation."
+    backend.translator.reply_error = core.BridgeError("Synthetic incremental outage")
+    assert run(backend, live_reply(backend, first))["state"] == "failed"
+    backend.translator.reply_error = None
+    assert run(backend, live_reply(backend, first + " More native content arrives."))["state"] == "failed"
+    assert len(backend.translator.reply_translations) == 1
+    replacement = run(backend, live_reply(backend, "A completely different new reply can translate."))
+    assert replacement["state"] == "translated"
+    assert len(backend.translator.reply_translations) == 2
+
+
+def test_live_reply_failure_can_retry_explicitly_and_chunk_cache_survives_restart(backend):
+    text = "Another complete sentence ready for live translation."
+    payload = live_reply(backend, text)
+    backend.translator.reply_error = core.BridgeError("Synthetic incremental outage")
+    assert run(backend, payload)["state"] == "failed"
+    backend.translator.reply_error = None
+    retry = live_reply(backend, text).model_copy(update={"retry": True})
+    assert run(backend, retry)["result"]["complete"]
+    backend.service.reply_streams.clear()
+    assert run(backend, live_reply(backend, text))["result"]["complete"]
+    assert len(backend.translator.reply_translations) == 2
+
+
+def test_live_reply_failure_is_not_retried_when_only_unprocessed_tail_is_rewritten(backend):
+    first = "A completed sentence ready for a failed translation.\n\n"
+    backend.translator.reply_error = core.BridgeError("Synthetic incremental outage")
+    assert run(backend, live_reply(backend, first + "Original unfinished tail"))["state"] == "failed"
+    backend.translator.reply_error = None
+    assert run(backend, live_reply(backend, first + "Rewritten unfinished tail"))["state"] == "failed"
+    assert len(backend.translator.reply_translations) == 1
+
+
+def test_live_reply_unfinished_code_waits_without_model_call(backend):
+    result = run(backend, live_reply(backend, "```python\nprint('unfinished')"))
+    assert result["state"] == "translated" and not result["result"]["next_ready"]
+    assert result["result"]["translated_source"] == ""
+    assert backend.translator.reply_translations == []
+
+
+def test_live_reply_wrong_connection_is_rejected_before_paid_call(backend):
+    payload = live_reply(backend, "A complete sentence ready for live translation.")
+    result = run(backend, payload.model_copy(update={"connection_revision": "c" * 64}))
+    assert result["state"] == "failed"
+    assert backend.translator.reply_translations == []
+
+
+def test_live_reply_reuses_old_whole_reply_cache_as_incremental_prefix(backend):
+    first = "A finished reply already translated in the previous version."
+    payload = live_reply(backend, first)
+    profile = backend.service.config()["profiles"][PROFILE]
+    key = mobile.translation_key(first, profile, PROFILE, [])
+    backend.service.reply_cache.put(key, first, {"text": "此前已完成的译文。"})
+    cached = run(backend, payload)
+    assert cached["result"]["translated_text"] == "此前已完成的译文。"
+    assert backend.translator.reply_translations == []
+    tail = "A newly appended sentence now needs translation."
+    result = run(backend, live_reply(backend, first + "\n\n" + tail, generating=False))
+    assert result["result"]["complete"]
+    assert backend.translator.reply_translations == [(tail, [])]
 
 
 def test_code_upload_rejected_before_storing_file(backend):

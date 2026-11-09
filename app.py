@@ -19,7 +19,7 @@ from core import (APP_DIR, DATA_DIR, PRESETS, BridgeError, CodexTranslator, SSH,
                   atomic_json, delivery_fingerprint, effective_reasoning_effort, make_profile, protect_key,
                   reasoning_options, save_config, send_fingerprint, unprotect_key, validate_text)
 from media import build_bundle, check_cancel, compose_prompt, kind, upload_bundle
-from reply_translations import ReplyCache, translation_key
+from reply_translations import IncrementalReply, ReplyCache, translation_key, translation_revision
 
 STYLE = """
 QWidget { color: #192E47; font-family: 'Microsoft YaHei UI'; font-size: 13px; }
@@ -796,6 +796,7 @@ class Window(QMainWindow):
         self.current_target_context = ""
         self.closing = False
         self.reply_cache = ReplyCache(DATA_DIR / "reply-translations")
+        self.reply_stream = IncrementalReply()
         self.reply_failures = {}
         self.attachments = []
         self.cancel_transfer = threading.Event()
@@ -953,7 +954,7 @@ class Window(QMainWindow):
         self.reply_translate.setObjectName("replyTranslate")
         self.reply_translate.setCheckable(True)
         self.reply_translate.setChecked(bool(self.config.get("auto_translate_reply", False)))
-        self.reply_translate.setToolTip("激活后自动译成中文；关闭显示原文。沿用顶部菜单中选择的翻译连接，代码和链接保留原样。")
+        self.reply_translate.setToolTip("激活后随回复分段译成中文；关闭显示原文。只翻译新增完整段落或句子，代码和链接保留原样。")
         self.reply_translate.toggled.connect(self.reply_translation_toggled)
         terminal_header.addWidget(self.reply_translate)
         self.auto_refresh = QCheckBox("自动刷新")
@@ -1695,6 +1696,33 @@ class Window(QMainWindow):
         pid = self.config["provider"]
         return translation_key(self.reply_original, self.config["profiles"][pid], pid, self.reply_code_blocks)
 
+    def sync_reply_translation(self):
+        pid = self.config["provider"]
+        profile = self.config["profiles"][pid]
+        self.reply_config_error = ""
+        try:
+            revision = translation_revision(profile)
+        except BridgeError as exc:
+            self.reply_config_error = str(exc)
+            revision = "invalid:" + json.dumps({name: profile.get(name, "") for name in
+                ("kind", "base_url", "model", "protocol", "reasoning_effort", "codex_path")}, sort_keys=True)
+        scope = json.dumps([self.config["ssh"]["host"], self.reply_context, pid,
+                            revision], ensure_ascii=False)
+        self.reply_stream.sync(self.reply_original, generating=self.reply_generating,
+                               scope=scope, code_blocks=self.reply_code_blocks)
+        return scope
+
+    def reply_stream_failure_key(self):
+        # A growing tail must not silently retry a failed model request with a
+        # slightly different chunk boundary. An explicit toggle permits retry.
+        return (self.reply_stream.scope, self.reply_stream.translated_source)
+
+    def reply_stream_failure(self):
+        record = self.reply_failures.get(self.reply_stream_failure_key())
+        if isinstance(record, dict) and self.reply_original.startswith(record["prefix"]):
+            return record["error"]
+        return ""
+
     def set_reply_text(self, value):
         if self.terminal.toPlainText() == value:
             return
@@ -1704,20 +1732,34 @@ class Window(QMainWindow):
         bar.setValue(bar.maximum() if at_end else old)
 
     def render_reply(self):
+        self.sync_reply_translation()
         value = self.reply_original
         status = ""
-        if self.reply_translate.isChecked() and value:
+        if self.reply_translate.isChecked() and value and self.reply_config_error:
+            status = "翻译设置不可用，显示原文"
+            self.reply_translation_status.setToolTip(self.reply_config_error)
+        elif self.reply_translate.isChecked() and value:
             key = self.current_reply_key()
             cached = self.reply_cache.get(key, value)
             if cached:
+                self.reply_stream.seed_cached(cached)
                 value = cached["text"]
-            elif self.reply_generating:
-                status = "回复完成后自动翻译"
-            elif key in self.reply_failures:
-                status = "翻译失败，显示原文"
             else:
-                status = "正在翻译…" if self.reply_job else "等待翻译…"
-            self.reply_translation_status.setToolTip(self.reply_failures.get(key, ""))
+                value = self.reply_stream.render()
+                failure = self.reply_stream_failure()
+                if failure:
+                    status = "本段翻译失败，保留已译内容；关闭后重开可重试"
+                elif self.reply_job:
+                    status = "正在实时分段翻译…"
+                elif self.reply_stream.complete:
+                    status = "已译到最新内容，等待新回复…" if self.reply_generating else ""
+                elif self.reply_stream.next_chunk():
+                    status = "等待翻译新增内容…"
+                else:
+                    status = "正在接收，完整句子出来后翻译…"
+                self.reply_translation_status.setToolTip(failure)
+            if cached:
+                self.reply_translation_status.setToolTip("")
         self.reply_translation_status.setText(" · ".join(value for value in (self.reply_read_status, status) if value))
         if self.reply_read_error:
             self.reply_translation_status.setToolTip(self.reply_read_error)
@@ -1727,6 +1769,8 @@ class Window(QMainWindow):
 
     def accept_reply(self, result):
         self.reply_heading.setText("Claude Code 回复" if result.get("mode") == "Code" else "Claude 回复")
+        if result.get("context"):
+            self.reply_context = result["context"]
         self.reply_original = result.get("text", "").rstrip("\r\n")
         self.reply_code_blocks = [x for x in result.get("code_blocks", []) if isinstance(x, str)]
         self.reply_generating = bool(result.get("generating", False))
@@ -1741,7 +1785,8 @@ class Window(QMainWindow):
         self.config["auto_translate_reply"] = checked
         save_config(self.config)
         if checked:
-            self.reply_failures.pop(self.current_reply_key(), None)
+            self.sync_reply_translation()
+            self.reply_failures.pop(self.reply_stream_failure_key(), None)
             self.auto_refresh.setChecked(True)
             if not self.reply_original and not self.busy:
                 self.refresh(quiet=True)
@@ -1749,16 +1794,42 @@ class Window(QMainWindow):
         self.maybe_translate_reply()
 
     def maybe_translate_reply(self):
-        if not self.reply_translate.isChecked() or not self.reply_original or self.reply_generating or self.reply_job:
+        if not self.reply_translate.isChecked() or not self.reply_original or self.reply_job:
             return
-        key = self.current_reply_key()
-        source, blocks = self.reply_original, list(self.reply_code_blocks)
-        if self.reply_cache.get(key, source) or key in self.reply_failures:
+        self.sync_reply_translation()
+        if self.reply_config_error:
+            self.render_reply()
             return
+        cached_reply = self.reply_cache.get(self.current_reply_key(), self.reply_original)
+        if cached_reply:
+            self.reply_stream.seed_cached(cached_reply)
+            return
+        pid = self.config["provider"]
+        profile = dict(self.config["profiles"][pid])
+        failure_key = self.reply_stream_failure_key()
+        if self.reply_stream_failure():
+            return
+        chunk = self.reply_stream.next_chunk()
+        while chunk:
+            key = translation_key(chunk["source"], profile, pid, chunk["code_blocks"])
+            cached = self.reply_cache.get(key, chunk["source"])
+            if not cached:
+                break
+            if not self.reply_stream.accept(chunk, cached):
+                return
+            failure_key = self.reply_stream_failure_key()
+            if self.reply_stream_failure():
+                self.render_reply()
+                return
+            chunk = self.reply_stream.next_chunk()
+        if not chunk:
+            self.render_reply()
+            return
+        source, blocks = chunk["source"], chunk["code_blocks"]
         try:
             translator = self.translator()
         except BridgeError as exc:
-            self.reply_failures[key] = str(exc)
+            self.reply_failures[failure_key] = {"error": str(exc), "prefix": chunk["prefix"] + chunk["raw_source"]}
             self.render_reply()
             return
         job = Job(lambda: translator.translate_reply(source, code_blocks=blocks))
@@ -1770,11 +1841,18 @@ class Window(QMainWindow):
                 self.reply_cache.put(key, source, result)
             except OSError:
                 self.statusBar().showMessage("译文已完成，但本机缓存未能保存。")
+            self.sync_reply_translation()
+            if self.reply_stream.accept(chunk, result) and self.reply_stream.complete:
+                try:
+                    self.reply_cache.put(self.current_reply_key(), self.reply_original,
+                        {"text": self.reply_stream.render(), "model": result.get("model", "")})
+                except OSError:
+                    self.statusBar().showMessage("译文已完成，但本机缓存未能保存。")
             self.render_reply()
             self.maybe_translate_reply()
         def failed(error):
             self.reply_job = None
-            self.reply_failures[key] = error
+            self.reply_failures[failure_key] = {"error": error, "prefix": chunk["prefix"] + chunk["raw_source"]}
             self.render_reply()
             self.maybe_translate_reply()
         job.signals.done.connect(done)

@@ -41,12 +41,10 @@ class FakeTranslator:
         return {"text": "中文：" + source, "model": "test-model"}
 
 with patch.object(window, "translator", return_value=FakeTranslator()), patch.object(window, "refresh") as refresh:
-    window.accept_reply({"text": first, "code_blocks": [code], "generating": True})
+    window.accept_reply({"text": first, "code_blocks": [code], "generating": False})
     assert window.terminal.toPlainText() == first
     window.reply_translate.setChecked(True)
     window.auto_refresh.setChecked(False)
-    assert not calls  # A partial streaming response must not be repeatedly translated.
-    window.accept_reply({"text": first, "code_blocks": [code], "generating": False})
     assert not window.busy
     settle(lambda: window.reply_job is None)
     assert window.terminal.toPlainText() == "中文：" + first
@@ -75,4 +73,4 @@ with patch.object(window, "translator", return_value=FakeTranslator()), patch.ob
     assert window.terminal.toPlainText() == third
     assert not refresh.called
 window.close()
-print("Reply UI: toggle, cache reuse, completed-response-only translation, and stale-result guard OK")
+print("Reply UI: toggle, cache reuse, completed-response translation, and stale-result guard OK")

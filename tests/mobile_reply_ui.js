@@ -356,6 +356,165 @@ async function latestReadStatesAreExplicitWithoutPaidCalls() {
   assert.equal(failure.posts.length, 0);
 }
 
+class StreamService extends MockService {
+  constructor(mode = "immediate") {
+    super(mode);
+    this.nativeText = "First completed live sentence for translation.\n\nUnfinished tail";
+    this.nativeGenerating = true;
+    this.nativeContext = "a".repeat(64);
+    this.translationRevision = "1".repeat(64);
+    this.connectionRevision = "2".repeat(64);
+    this.consumeAll = false;
+    this.translatedPrefix = "";
+    this.translatedText = "";
+    this.fail = false;
+  }
+  state() {
+    const state = super.state();
+    return {...state, connection_revision: this.connectionRevision,
+      capabilities: {incremental_reply_translation: true}, target: {...state.target, context: this.nativeContext},
+      reply: {text: this.nativeText, source_hash: crypto.createHash("sha256").update(this.nativeText).digest("hex"),
+        context: this.nativeContext, mode: "Code", generating: this.nativeGenerating, updated_at: Date.now()}};
+  }
+  complete(payload, override = null) {
+    let result;
+    if (override) result = override;
+    else {
+      const split = this.nativeText.indexOf("\n\n") + 2;
+      if (this.consumeAll || !this.nativeGenerating || this.translatedPrefix) {
+        this.translatedPrefix = this.nativeText;
+        this.translatedText = "第一段的实时译文。\n\n新追加内容的译文。";
+      } else if (split > 1) {
+        this.translatedPrefix = this.nativeText.slice(0, split);
+        this.translatedText = "第一段的实时译文。\n\n";
+      }
+      result = {incremental: true, context: this.nativeContext, translation_revision: this.translationRevision,
+        connection_revision: this.connectionRevision, source: this.nativeText,
+        source_hash: crypto.createHash("sha256").update(this.nativeText).digest("hex"),
+        translated_source: this.translatedPrefix, translated_text: this.translatedText,
+        text: this.translatedText + this.nativeText.slice(this.translatedPrefix.length),
+        complete: this.translatedPrefix.length === this.nativeText.length,
+        next_ready: false, generating: this.nativeGenerating};
+    }
+    const job = {id: payload.id, action: "translate_reply", profile: payload.profile,
+      state: this.fail ? "failed" : "translated", result: this.fail ? null : result,
+      error: this.fail ? "Synthetic streaming outage" : ""};
+    this.jobs.set(job.id, job);
+    this.activeJob = null;
+    return job;
+  }
+  async fetch(url, options) {
+    if (url === "/api/jobs" && options.method === "POST") {
+      const payload = JSON.parse(options.body);
+      assert.equal(payload.action, "translate_reply");
+      assert.equal(payload.incremental, true);
+      assert.equal(payload.connection_revision, this.connectionRevision);
+      assert.equal(payload.expected_context, this.nativeContext);
+      this.posts.push(copy(payload));
+      const job = {id: payload.id, action: payload.action, profile: payload.profile, state: "queued"};
+      this.jobs.set(payload.id, job);
+      if (this.mode === "queued") return response(job);
+      return response(this.complete(payload));
+    }
+    return super.fetch(url, options);
+  }
+}
+
+async function liveReplyTranslatesWhileGeneratingAndKeepsChinesePrefix() {
+  const service = new StreamService();
+  const storage = new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]);
+  const page = browser(service, storage);
+  await settle(() => page.elements.get("reply-text").textContent.startsWith("第一段的实时译文。"), "Live first paragraph");
+  assert.equal(page.elements.get("reply-text").textContent, "第一段的实时译文。\n\nUnfinished tail");
+  assert.equal(service.posts.length, 1);
+  page.poll(5000);
+  page.poll(5000);
+  await settle(() => page.elements.get("reply-status").textContent.includes("完整语句"), "Wait for another complete sentence");
+  assert.equal(service.posts.length, 1, "Do not translate an unchanged partial snapshot repeatedly");
+  service.nativeText += " has become a complete new sentence.";
+  page.poll(5000);
+  await settle(() => page.elements.get("reply-text").textContent.includes("新追加内容的译文。"), "Translate growing suffix");
+  assert.equal(service.posts.length, 2);
+  page.click("translate-reply-button");
+  assert.equal(page.elements.get("reply-text").textContent, service.nativeText);
+  page.click("translate-reply-button");
+  assert.equal(page.elements.get("reply-text").textContent, service.translatedText);
+  assert.equal(service.posts.length, 2, "Toggling reuses the accepted Chinese prefix");
+}
+
+async function liveReplyNoReadyWaitsUntilNativeGenerationFinishes() {
+  const service = new StreamService();
+  service.nativeText = "An unfinished fragment";
+  const storage = new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]);
+  const page = browser(service, storage);
+  await settle(() => service.posts.length === 1 && page.draft().pendingReplyJob === null, "Incomplete fragment checked");
+  page.poll(5000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(service.posts.length, 1);
+  assert.equal(page.elements.get("reply-text").textContent, service.nativeText);
+  service.nativeGenerating = false;
+  page.poll(5000);
+  await settle(() => page.elements.get("reply-text").textContent === service.translatedText, "Flush finished fragment");
+  assert.equal(service.posts.length, 2, "Final generation state flushes even when source hash did not change");
+}
+
+async function liveReplyProcessesMoreThanOneChunkForTheSameNativeSnapshot() {
+  class MultiChunkService extends StreamService {
+    complete(payload) {
+      const job = super.complete(payload);
+      if (this.posts.length === 1) job.result.next_ready = true;
+      return job;
+    }
+  }
+  const service = new MultiChunkService();
+  const storage = new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]);
+  const page = browser(service, storage);
+  await settle(() => service.posts.length === 2 && page.elements.get("reply-text").textContent.includes("新追加内容的译文。"), "Second stable chunk for same source hash");
+  assert.equal(service.posts[0].source_hash, service.posts[1].source_hash);
+  page.poll(5000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(service.posts.length, 2, "Completed cursor is not reposted");
+}
+
+async function liveReplyFailureKeepsPaidRetryExplicitAcrossGrowth() {
+  const service = new StreamService();
+  service.fail = true;
+  const storage = new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]);
+  const page = browser(service, storage);
+  await settle(() => page.elements.get("reply-status").textContent === "Synthetic streaming outage", "Live failure");
+  service.fail = false;
+  service.nativeText += " More output arrives.";
+  page.poll(5000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(service.posts.length, 1, "New output must not automatically retry a failed paid call");
+  page.click("translate-reply-button");
+  assert.equal(page.elements.get("reply-text").textContent, service.nativeText);
+  page.click("translate-reply-button");
+  await settle(() => service.posts.length === 2 && page.draft().pendingReplyJob === null, "Explicit live retry");
+  assert.equal(service.posts[1].retry, true);
+}
+
+async function liveReplyLateResultCannotReplaceAnotherContextAndReloadUsesOriginalId() {
+  const service = new StreamService("queued");
+  const storage = new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]);
+  const page = browser(service, storage);
+  await settle(() => service.posts.length === 1, "Pending live translation");
+  const originalId = service.posts[0].id;
+  const oldResult = {incremental: true, context: service.nativeContext, translation_revision: service.translationRevision,
+    connection_revision: service.connectionRevision, source: service.nativeText, source_hash: service.posts[0].source_hash,
+    translated_source: service.nativeText, translated_text: "旧会话的译文。", text: "旧会话的译文。",
+    complete: true, next_ready: false, generating: true};
+  service.nativeContext = "b".repeat(64);
+  service.nativeText = "A different current native conversation reply.";
+  service.complete(service.posts[0], oldResult);
+  const reloaded = browser(service, page.storage);
+  await settle(() => service.jobReads.includes(originalId) && service.posts.length === 2, "Original live job recovered, then current context queued");
+  assert.equal(reloaded.elements.get("reply-text").textContent, service.nativeText);
+  assert(!reloaded.elements.get("reply-text").textContent.includes("旧会话"));
+  assert.equal(service.posts.filter(payload => payload.expected_context === "a".repeat(64)).length, 1,
+    "Reload only queries the old request ID; it never resubmits it");
+}
+
 (async () => {
   await slowPostDoesNotStopPolling();
   await immediateCachedResultRenders();
@@ -364,6 +523,11 @@ async function latestReadStatesAreExplicitWithoutPaidCalls() {
   await lateReplyRetainsItsActualSettingsRevision();
   await executionTimeRevisionCanSatisfyTheNewSettings();
   await latestReadStatesAreExplicitWithoutPaidCalls();
+  await liveReplyTranslatesWhileGeneratingAndKeepsChinesePrefix();
+  await liveReplyNoReadyWaitsUntilNativeGenerationFinishes();
+  await liveReplyProcessesMoreThanOneChunkForTheSameNativeSnapshot();
+  await liveReplyFailureKeepsPaidRetryExplicitAcrossGrowth();
+  await liveReplyLateResultCannotReplaceAnotherContextAndReloadUsesOriginalId();
   console.log("Mobile reply UI passed: latest empty/error states, delayed polling, cached/reloaded results, stable profile ID, effort revisions, late-result correlation, no instruction resubmission");
 })().catch(error => {
   console.error(error);

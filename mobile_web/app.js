@@ -87,6 +87,8 @@
   const receiptJobs = new Map();
   const receiptChecks = new Map();
   const translatedReplies = new Map();
+  const replyStreams = new Map();
+  const replyStreamFailures = new Map();
   const replyFailures = new Map();
   const requestedReplies = new Set();
   const retryReplyKeys = new Set();
@@ -836,6 +838,27 @@
 
     if (isReplyJob) {
       const tracked = pendingReplyJob?.id === job.id ? pendingReplyJob : null;
+      if (job.result?.incremental || tracked?.payload?.incremental) {
+        const result = job.result;
+        const scope = result?.incremental ? replyStreamScope(result.context, job.profile, result.translation_revision, result.connection_revision) : tracked?.stream_scope;
+        if (job.state === "translated" && result?.incremental && scope && typeof result.translated_source === "string" &&
+            typeof result.translated_text === "string" && typeof result.source === "string" && result.source.startsWith(result.translated_source)) {
+          replyStreams.set(scope, result);
+          if (!result.next_ready || result.complete) {
+            // Stable partial snapshots with no complete new sentence wait for
+            // another native update instead of repeatedly posting paid work.
+            requestedReplies.add(streamRequestKey(result, scope, result.translated_source.length));
+          }
+        } else if (scope) {
+          replyStreamFailures.set(scope, {error: job.error || "分段翻译未完成，保留已有译文。", source: tracked?.reply_source || ""});
+        }
+        if (tracked) pendingReplyJob = null;
+        saveDraft();
+        renderReply();
+        renderControls();
+        ensureReplyTranslation();
+        return;
+      }
       // A settings save can happen while a translation is running. The result's
       // revision identifies what actually ran; never label it as the new effort.
       const resultRevision = job.result?.translation_revision;
@@ -962,6 +985,29 @@
     return hash && profile ? `${profile}|${revision ? `${revision}|` : ""}${hash}` : "";
   }
 
+  function replyStreamScope(context = currentReply()?.context, profile = selectedProfile, revision = undefined, connection = serverState?.connection_revision || "") {
+    if (revision === undefined) revision = serverState?.profiles?.find(item => item.id === profile)?.translation_revision || "";
+    return context && profile && revision ? JSON.stringify([context, profile, revision, connection]) : "";
+  }
+
+  function streamRequestKey(reply, scope, consumed) {
+    return `${scope}|${reply.source_hash}|${reply.generating ? 1 : 0}|${consumed}`;
+  }
+
+  function currentReplyStream(reply, scope) {
+    const result = replyStreams.get(scope);
+    return result && typeof reply?.text === "string" && reply.text.startsWith(result.translated_source) ? result : null;
+  }
+
+  function currentStreamFailure(reply, scope) {
+    const failed = replyStreamFailures.get(scope);
+    if (failed && failed.source && !reply.text.startsWith(failed.source) && !failed.source.startsWith(reply.text)) {
+      replyStreamFailures.delete(scope);
+      return null;
+    }
+    return failed;
+  }
+
   function renderReply() {
     const matched = currentReply();
     const reply = matched || {};
@@ -972,11 +1018,23 @@
     const key = replyKey();
     const translated = translatedReplies.get(key);
     const original = typeof reply.text === "string" ? reply.text : "";
+    const streaming = serverState?.capabilities?.incremental_reply_translation === true;
+    const scope = streaming ? replyStreamScope(reply.context) : "";
+    const progress = scope ? currentReplyStream(reply, scope) : null;
     let content = original;
     let status = readError || (reply.loading ? "正在读取最后一条 Claude 回复…" :
       matched ? "" : replyNavigation?.action === "match_current" ? "正在读取 Ubuntu 当前对话的最新回复…" : "正在读取所选会话的最新回复…");
     if (!readError && replyTranslated && original) {
-      if (translated) content = translated;
+      if (streaming && scope) {
+        if (progress) content = progress.translated_text + original.slice(progress.translated_source.length);
+        const failed = currentStreamFailure(reply, scope);
+        if (failed) status = failed.error;
+        else if (!serverState?.worker?.online) status = "电脑连接恢复后继续翻译";
+        else if (pendingReplyJob?.stream_scope === scope) status = "正在实时翻译新内容…";
+        else if (progress?.translated_source.length === original.length) status = reply.generating ? "已实时翻译，等待新内容…" : "";
+        else status = reply.generating ? "实时翻译已开启，等待完整语句…" : "等待翻译新内容…";
+      }
+      else if (translated) content = translated;
       else if (!serverState?.worker?.online) status = "电脑连接恢复后翻译";
       else if (reply.generating) status = "回复完成后自动翻译";
       else if (replyFailures.has(key)) status = replyFailures.get(key);
@@ -1007,6 +1065,7 @@
 
   async function ensureReplyTranslation() {
     const reply = currentReply();
+    if (serverState?.capabilities?.incremental_reply_translation === true) return ensureIncrementalReply(reply);
     const key = replyKey();
     if (!authenticated || !connected || !serverState?.worker?.online || document.hidden || !replyTranslated || !reply?.text || !key || reply.generating || reply.loading || reply.error ||
         pendingReplyJob || pendingJob || posting || serverState?.worker?.busy ||
@@ -1031,6 +1090,36 @@
       } else {
         showNotice(`${error.message} 正在查询本次回复翻译的结果。`, true);
       }
+    } finally {
+      postingIds.delete(id);
+    }
+  }
+
+  async function ensureIncrementalReply(reply) {
+    const scope = replyStreamScope(reply?.context);
+    if (!authenticated || !connected || !serverState?.worker?.online || document.hidden || !replyTranslated || !reply?.text || !scope || reply.loading || reply.error ||
+        pendingReplyJob || pendingJob || posting || serverState?.worker?.busy || currentStreamFailure(reply, scope)) return;
+    const progress = currentReplyStream(reply, scope);
+    const consumed = progress?.translated_source.length || 0;
+    const key = streamRequestKey(reply, scope, consumed);
+    if (consumed === reply.text.length || requestedReplies.has(key)) return;
+    const id = makeId();
+    const retry = retryReplyKeys.delete(scope);
+    const payload = {id, action: "translate_reply", profile: selectedProfile, source: "", source_hash: reply.source_hash,
+      expected_context: reply.context, english: "", auto_enter: false, attachment_ids: [], retry, incremental: true};
+    payload.connection_revision = serverState.connection_revision || "";
+    requestedReplies.add(key);
+    pendingReplyJob = {id, action: "translate_reply", key, stream_scope: scope, profile: selectedProfile,
+      source_hash: reply.source_hash, reply_source: reply.text, payload};
+    postingIds.add(id);
+    saveDraft();
+    renderReply();
+    try {
+      handleJob(normaliseJob(await api("/api/jobs", {method: "POST", body: payload})));
+    } catch (error) {
+      if (error.status >= 400 && error.status < 500 && error.status !== 408) {
+        handleJob({id, action: "translate_reply", state: "failed", error: error.message});
+      } else showNotice(`${error.message} 正在查询本次分段翻译的结果。`, true);
     } finally {
       postingIds.delete(id);
     }
@@ -1070,7 +1159,9 @@
       ui.jobStatus.hidden = true;
     }
     if (pendingReplyJob?.id === pending.id) {
-      replyFailures.set(pending.key, "本次回复翻译已结束跟踪，当前显示原文。");
+      if (pendingReplyJob.payload?.incremental && pendingReplyJob.stream_scope) {
+        replyStreamFailures.set(pendingReplyJob.stream_scope, {error: "本次分段翻译已结束跟踪，保留已有译文。", source: pendingReplyJob.reply_source || ""});
+      } else replyFailures.set(pending.key, "本次回复翻译已结束跟踪，当前显示原文。");
       pendingReplyJob = null;
     }
     saveDraft();
@@ -1086,6 +1177,12 @@
       replyFailures.delete(key);
       requestedReplies.delete(key);
       if (key) retryReplyKeys.add(key);
+      const scope = replyStreamScope();
+      if (scope) {
+        replyStreamFailures.delete(scope);
+        for (const requested of requestedReplies) if (requested.startsWith(scope + "|")) requestedReplies.delete(requested);
+        retryReplyKeys.add(scope);
+      }
     }
     saveDraft();
     renderReply();

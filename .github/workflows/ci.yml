@@ -33,6 +33,8 @@ jobs:
           python tests/settings_devices_ui.py
           python tests/desktop_match_ui.py
           python tests/desktop_reply_read_ui.py
+          python tests/desktop_reply_stream_ui.py
+          python tests/reply_ui_smoke.py
       - name: Mobile UI
         run: |
           node tests/mobile_reply_ui.js

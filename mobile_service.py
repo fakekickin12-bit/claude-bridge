@@ -28,7 +28,7 @@ from device_auth import (DEVICE_COOKIE, DEVICE_TTL, PAIR_CODE_TTL,
                          issue_pairing_code, list_devices, password_hash,
                          restrict_local_access, revoke_device)
 from media import build_bundle, compose_prompt, kind, upload_bundle
-from reply_translations import ReplyCache, translation_key, translation_revision
+from reply_translations import IncrementalReply, ReplyCache, translation_key, translation_revision
 
 WEB = Path(__file__).parent / "mobile_web"
 TERMINAL_STATES = {"translated", "pasted", "submitted", "failed", "unknown"}
@@ -77,6 +77,8 @@ class JobRequest(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list, max_length=20)
     source_hash: str = Field(default="", max_length=64)
     retry: bool = False
+    incremental: bool = False
+    connection_revision: str = Field(default="", max_length=64)
     catalog_id: str = Field(default="", max_length=64)
     project_id: str = Field(default="", max_length=64)
     session_id: str = Field(default="", max_length=64)
@@ -131,11 +133,13 @@ class MobileBridge:
         self.worker_error = False
         self.last_seen = 0.0
         self.active_job = None
+        self.active_job_action = None
         self.target = {"ready": False, "reason": "正在连接 Ubuntu…"}
         self.reply = {"text": "", "source_hash": "", "mode": "", "context": "", "loading": False,
                       "generating": False, "updated_at": 0}
         self.code_blocks = []
         self.reply_cache = ReplyCache(self.data_dir / "reply-translations")
+        self.reply_streams = {}
         self.login_failures = deque()
         self.project_catalog = {"projects": [], "loading": False, "reason": ""}
         self.projects_initialized = False
@@ -237,6 +241,11 @@ class MobileBridge:
         canonical = dict(payload)
         if not canonical["session_catalog_id"]:
             canonical.pop("session_catalog_id")
+        if not canonical["incremental"]:
+            # Retain fingerprints of requests saved before incremental replies.
+            canonical.pop("incremental")
+        if not canonical["connection_revision"]:
+            canonical.pop("connection_revision")
         fingerprint = hashlib.sha256(json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         now = time.time()
         with self.database() as db:
@@ -370,6 +379,8 @@ class MobileBridge:
             profiles.append(public)
         return {"csrf": csrf, "profiles": profiles, "default_profile": config["provider"],
                 "target": target, "reply": reply,
+                "connection_revision": hashlib.sha256(json.dumps(config.get("ssh", {}), ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
+                "capabilities": {"incremental_reply_translation": True},
                 "worker": {"online": bool(self.threads and self.threads[0].is_alive() and not self.worker_error),
                            "busy": active is not None},
                 "active_job": self.job(active) if active else None}
@@ -510,6 +521,8 @@ class MobileBridge:
             self.code_blocks = [value for value in reply.get("code_blocks", []) if isinstance(value, str)]
 
     def translate_reply(self, payload):
+        if payload.get("incremental"):
+            return self.translate_reply_chunk(payload)
         with self.lock:
             reply, blocks = dict(self.reply), list(self.code_blocks)
         if not reply["text"] or reply["generating"] or payload["source_hash"] != reply["source_hash"]:
@@ -541,6 +554,93 @@ class MobileBridge:
         return {"text": result["text"], "source_hash": reply["source_hash"], "model": result.get("model", ""),
                 "translation_revision": revision}
 
+    def translate_reply_chunk(self, payload):
+        """Translate one new stable segment; a native capture may append meanwhile."""
+        config = self.config()
+        profile_id = payload["profile"]
+        if profile_id not in config["profiles"]:
+            raise core.BridgeError("翻译连接已变化，请重新选择。")
+        profile = dict(config["profiles"][profile_id])
+        revision = translation_revision(profile)
+        context = payload.get("expected_context", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", context):
+            raise core.BridgeError("回复所属会话尚未确认，请等读取完成。")
+        connection = json.dumps(config.get("ssh", {}), ensure_ascii=False, sort_keys=True)
+        connection_revision = hashlib.sha256(connection.encode()).hexdigest()
+        if payload.get("connection_revision") != connection_revision:
+            raise core.BridgeError("Ubuntu 连接已变化，请读取当前连接后继续翻译。")
+        scope = json.dumps([context, profile_id, revision, connection], ensure_ascii=False)
+        with self.lock:
+            reply = dict(self.reply)
+            if (reply.get("context") != context or self.target.get("context") != context
+                    or reply.get("loading") or reply.get("error")):
+                raise core.BridgeError("回复所属会话已变化，请等待当前会话的回复。")
+            stream = self.reply_streams.get(scope)
+            if stream is None:
+                stream = IncrementalReply()
+                # Bound process memory; all paid chunks remain in the disk cache.
+                if len(self.reply_streams) >= 12:
+                    self.reply_streams.pop(next(iter(self.reply_streams)))
+                self.reply_streams[scope] = stream
+            stream.sync(reply.get("text", ""), generating=bool(reply.get("generating")),
+                        scope=scope, code_blocks=self.code_blocks)
+            if not stream.consumed and stream.source:
+                whole_key = translation_key(stream.source, profile, profile_id, self.code_blocks)
+                whole_cached = self.reply_cache.get(whole_key, stream.source)
+                if whole_cached:
+                    stream.seed_cached(whole_cached)
+            chunk = stream.next_chunk()
+        if chunk is not None:
+            key = translation_key(chunk["source"], profile, profile_id, chunk["code_blocks"])
+            # A growing unfinished suffix must not automatically retry a failed
+            # paid request at the same already-translated prefix.
+            failure_key = hashlib.sha256(json.dumps(["live-reply-attempt-v1", scope,
+                chunk["prefix"]], ensure_ascii=False).encode()).hexdigest()
+            cached = self.reply_cache.get(key, chunk["source"])
+            with self.database() as db:
+                failed = db.execute("SELECT error FROM reply_attempts WHERE key=?", (failure_key,)).fetchone()
+            if failed:
+                try:
+                    witness = json.loads(failed["error"])["source"]
+                    if not (reply.get("text", "").startswith(witness) or witness.startswith(reply.get("text", ""))):
+                        failed = None
+                except (ValueError, TypeError, KeyError):
+                    pass
+            if failed and not payload.get("retry") and not cached:
+                raise core.BridgeError("上次分段翻译未完成。保留已有译文；重新打开自动翻译可重试。")
+            if cached:
+                result = cached
+            else:
+                try:
+                    result = self.translator(profile_id, profile).translate_reply(
+                        chunk["source"], code_blocks=chunk["code_blocks"])
+                    self.reply_cache.put(key, chunk["source"], result)
+                except core.BridgeError as exc:
+                    with self.database() as db:
+                        db.execute("INSERT OR REPLACE INTO reply_attempts (key,error) VALUES (?,?)", (failure_key,
+                            json.dumps({"error": str(exc), "source": chunk["prefix"] + chunk["raw_source"]}, ensure_ascii=False)))
+                    raise
+            with self.database() as db:
+                db.execute("DELETE FROM reply_attempts WHERE key=?", (failure_key,))
+            if json.dumps(self.config().get("ssh", {}), ensure_ascii=False, sort_keys=True) != connection:
+                raise core.BridgeError("翻译期间 Ubuntu 连接已变化，旧连接译文未显示。")
+            with self.lock:
+                latest = dict(self.reply)
+                if latest.get("context") != context or self.target.get("context") != context:
+                    raise core.BridgeError("翻译期间已切换会话，旧会话译文未显示。")
+                stream.sync(latest.get("text", ""), generating=bool(latest.get("generating")),
+                            scope=scope, code_blocks=self.code_blocks)
+                if not stream.accept(chunk, result):
+                    raise core.BridgeError("回复正文已改写，旧分段译文未显示。")
+        with self.lock:
+            next_ready = stream.next_chunk() is not None
+            return {"incremental": True, "context": context, "translation_revision": revision,
+                    "connection_revision": connection_revision,
+                    "source": stream.source, "source_hash": hashlib.sha256(stream.source.encode()).hexdigest(),
+                    "text": stream.render(), "translated_source": stream.translated_source,
+                    "translated_text": stream.translated_text, "complete": stream.complete,
+                    "next_ready": next_ready, "generating": stream.generating}
+
     def attachment_paths(self, identifiers):
         paths = []
         with self.database() as db:
@@ -561,6 +661,7 @@ class MobileBridge:
         job_id, payload = row["id"], json.loads(row["payload"])
         with self.lock:
             self.active_job = job_id
+            self.active_job_action = payload["action"]
         delivery_started = False
         receipts = []
         config = None
@@ -727,6 +828,7 @@ class MobileBridge:
         finally:
             with self.lock:
                 self.active_job = None
+                self.active_job_action = None
             if payload["action"] in {"open_project", "switch_project", "match_current"}:
                 self.capture_wake.set()
 
@@ -748,6 +850,7 @@ class MobileBridge:
                     self.worker_error = True
                     with self.lock:
                         self.active_job = None
+                        self.active_job_action = None
                     try:
                         with self.database() as db:
                             db.execute("UPDATE jobs SET state='unknown',phase='需要查看结果',error=?,updated_at=? WHERE state='running'",
@@ -760,10 +863,11 @@ class MobileBridge:
             while not self.stop_event.is_set():
                 with self.lock:
                     active = self.active_job
+                    translating_reply = self.active_job_action == "translate_reply"
                     recent = time.monotonic() - self.last_seen < 45
                 if self.projects_requested.is_set() and active is None:
                     self.fetch_projects()
-                elif recent and active is None:
+                elif recent and (active is None or translating_reply):
                     self.capture()
                 self.capture_wake.wait(5)
                 self.capture_wake.clear()
