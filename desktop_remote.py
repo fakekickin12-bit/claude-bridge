@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -1962,10 +1962,23 @@ def setup(request):
 
 def dispatch(request):
     action = request.get("action")
+    if action in {"desktop_frame", "desktop_input", "desktop_input_status", "desktop_close"}:
+        import desktop_stream
+        try:
+            return desktop_stream.dispatch(request, root=ROOT, environment=environment())
+        except desktop_stream.StreamError as exc:
+            raise DesktopError(str(exc)) from None
     if action == "setup":
         return setup(request)
     if action == "start":
-        return start(request)
+        with (ROOT / "desktop.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                error = DesktopError("客户端正在处理其他桌面操作，请稍后再显示客户端。")
+                error.not_submitted = True
+                raise error from None
+            return start(request)
     if action == "probe":
         state = status()
         return {"version": VERSION, "transport": "desktop", **state}
@@ -1989,12 +2002,19 @@ def dispatch(request):
     if action == "delivery_status":
         return delivery_status(request)
     if action == "new":
-        current = check_ready(request)
-        page, _ = document()
-        button = find("push button", "New", page)
-        if not showing(button) or not button.queryAction().doAction(0):
-            raise DesktopError("未能打开新会话。请在 Ubuntu 的 Claude 客户端点击 New。")
-        return {"opened": True, "mode": current["mode"]}
+        with (ROOT / "desktop.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                error = DesktopError("客户端正在处理其他桌面操作，请稍后再新建对话。")
+                error.not_submitted = True
+                raise error from None
+            current = check_ready(request)
+            page, _ = document()
+            button = find("push button", "New", page)
+            if not showing(button) or not button.queryAction().doAction(0):
+                raise DesktopError("未能打开新会话。请在 Ubuntu 的 Claude 客户端点击 New。")
+            return {"opened": True, "mode": current["mode"]}
     if action == "capture":
         application = app()
         page, attrs = document(application)

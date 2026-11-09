@@ -215,6 +215,7 @@ function browser(service, options = {}) {
   const projectTimeouts = new Map();
   let timeoutId = 100000;
   const documentListeners = new Map();
+  const openedPages = [];
   const tabs = ["compose", "reply", "history"].map(tab => { const item = new Element(); item.dataset.tab = tab; return item; });
   const workspace = new Element();
   workspace.dataset.activeTab = "compose";
@@ -240,13 +241,14 @@ function browser(service, options = {}) {
       },
       createElement: () => new Element(), createElementNS: () => new Element(), createTextNode: text => text
     },
-    window: {location: {hash: "", pathname: "/", search: ""}, history: {replaceState() {}}, addEventListener() {}},
+    window: {location: {hash: "", pathname: "/", search: ""}, history: {replaceState() {}}, addEventListener() {},
+      open: (...args) => openedPages.push(args)},
     fetch: (url, options) => service.fetch(url, options)
   };
   vm.createContext(context);
   vm.runInContext(script, context);
   return {
-    elements, initial, storage, workspace, draft: () => JSON.parse(storage.get(storageKey)),
+    elements, initial, storage, workspace, openedPages, draft: () => JSON.parse(storage.get(storageKey)),
     click: id => elements.get(id).click(),
     choose(id, value) { elements.get(id).value = value; elements.get(id).dispatch("change"); },
     poll(milliseconds) { intervals.get(milliseconds)?.(); },
@@ -664,6 +666,15 @@ async function unknownMatchHasNoDeliveryReceipt() {
 }
 
 (async () => {
+  const desktopService = new ProjectService();
+  const desktopPage = browser(desktopService);
+  await settle(() => desktopPage.elements.get("profile-select").value === "synthetic", "Desktop menu fixture");
+  const desktopDraft = desktopPage.draft();
+  desktopPage.click("desktop-open-button");
+  assert.deepEqual(desktopPage.openedPages, [["/desktop", "_blank", "noopener"]]);
+  assert.equal(desktopService.posts.length, 0, "Opening a separate viewer must never submit a Claude task");
+  assert.equal(desktopPage.draft().source, desktopDraft.source);
+  assert.equal(desktopPage.draft().english, desktopDraft.english);
   await explicitProjectAndSessionNavigation();
   await pendingBlocksNavigationAndCodeExplainsAttachments();
   await asynchronousCatalogLoadingAndRefresh();

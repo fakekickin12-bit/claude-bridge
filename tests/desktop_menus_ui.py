@@ -119,9 +119,9 @@ def main():
                 application.processEvents()
                 assert desktop.DATA_DIR == core.DATA_DIR == data_dir
 
-                menus = [window.settings_menu, window.connection_menu, window.ubuntu_menu, window.history_menu]
+                menus = [window.settings_menu, window.connection_menu, window.ubuntu_menu, window.utilities_menu, window.history_menu]
                 assert window.menuBar().actions() == [menu.menuAction() for menu in menus]
-                assert [menu.title() for menu in menus] == ["设置", "翻译连接", "Ubuntu 客户端", "发送记录"]
+                assert [menu.title() for menu in menus] == ["设置", "翻译连接", "Ubuntu 客户端", "小工具", "发送记录"]
                 assert not window.findChildren(QFrame, "sidebar")
                 assert window.body_splitter.width() >= window.centralWidget().width() - 90
                 assert window.history_dialog is None and window.history_list is None

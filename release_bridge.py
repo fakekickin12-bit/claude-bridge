@@ -16,7 +16,7 @@ import tempfile
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_INSTALL_DIR = Path(os.environ.get("CLAUDE_BRIDGE_INSTALL_DIR", str(
     Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local/share"))) / "ClaudeBridge"))).expanduser()
-STATIC_FILES = ("app.js", "app.css", "icon.svg", "index.html", "manifest.webmanifest")
+STATIC_FILES = ("app.js", "app.css", "icon.svg", "desktop.js", "desktop.css", "desktop.html", "index.html", "manifest.webmanifest")
 BUILD_TOKEN = b"__BRIDGE_BUILD__"
 
 
@@ -49,7 +49,7 @@ def static_release(source_dir):
         digest.update(name.encode("utf-8") + b"\0")
         digest.update(files[name] + b"\0")
     version = digest.hexdigest()
-    files["app.js"] = files["app.js"].replace(BUILD_TOKEN, version.encode("ascii"))
+    files = {name: value.replace(BUILD_TOKEN, version.encode("ascii")) for name, value in files.items()}
     manifest["bridge_version"] = version
     files["manifest.webmanifest"] = (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     return version, files

@@ -20,6 +20,9 @@ def project(tmp_path, monkeypatch):
     source.mkdir(parents=True)
     payloads = {"app.js": b"const CLIENT_VERSION = '__BRIDGE_BUILD__';\n",
                 "app.css": b"body { color: blue; }\n", "icon.svg": b"<svg />\n",
+                "desktop.js": b"const DESKTOP_VERSION = '__BRIDGE_BUILD__';\n",
+                "desktop.css": b".desktop { display: block; }\n",
+                "desktop.html": b"<script src='/desktop.js?v=__BRIDGE_BUILD__'></script>\n",
                 "index.html": b"<script src='/app.js'></script>\n",
                 "manifest.webmanifest": b'{"name":"Synthetic Bridge","display":"standalone"}'}
     for name, content in payloads.items():
@@ -96,7 +99,7 @@ def test_web_only_publish_is_atomic_in_manifest_last_order_and_preserves_data(pr
     monkeypatch.setattr(release, "atomic_replace", record)
     result = publish(project, web_only=True)
     assert result["web_updated"] and not result["desktop_updated"]
-    assert replaced == ["app.js", "app.css", "icon.svg", "index.html", "manifest.webmanifest"]
+    assert replaced == ["app.js", "app.css", "icon.svg", "desktop.js", "desktop.css", "desktop.html", "index.html", "manifest.webmanifest"]
     assert (project.install / "ClaudeBridge.exe").read_bytes() == b"old-desktop"
     assert (project.install / "data" / "config.json").read_bytes() == b"synthetic-config-must-stay"
     assert (project.install / "mobile-service" / "backend.py").read_bytes() == b"synthetic-backend-must-stay"

@@ -115,6 +115,10 @@ API 和 Codex ChatGPT 订阅额度分别计费。选择 Codex 连接时，通过
 
 ## 手机和 iPad（可选）
 
+菜单中的「Ubuntu 桌面」会在独立网页显示当前 Ubuntu 桌面，支持触屏点击、右键、拖动、滚动、缩放、文字及常用按键。Windows「小工具 → Ubuntu 远程桌面…」打开同一网页；浏览器需先登记设备。画面及输入不使用翻译额度，通过现有 SSH/HTTPS 转发，不新增公网桌面端口。离开页面暂停刷新，输入结果未确认时只查原回执，不自动重做操作。
+
+此功能适配已解锁的 Ubuntu GNOME Wayland 当前会话，依赖系统的 Mutter RemoteDesktop/ScreenCast、PipeWire/GStreamer 和 Python GI。共享的是现有显示器，不创建另一个登录桌面；其他桌面或缺少组件时会明确提示。登记设备可操作完整桌面，请仅登记自己的可信设备，访问仍可从设备设置撤销。
+
 手机网页复用自己的 Windows 翻译连接和 SSH 目标。需要 Windows 保持登录并运行后台、Ubuntu 图形会话可用，以及自己配置的 HTTPS 入口。VPS 只负责 HTTPS 和受限隧道，API Key 与 Codex 登录留在 Windows。
 
 请先阅读 [手机端部署指南](deploy_mobile/GUIDE.md)，再按自己的域名、VPS 和路径配置。私人的部署设置存放在 `data/mobile/settings.json`；仓库只提供不含凭据的示例。未配置 HTTPS 入口时，设备配对不会生成可用的远程访问链接。

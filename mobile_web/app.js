@@ -31,6 +31,7 @@
     refreshProjects: byId("projects-refresh-button"),
     sessionPicker: byId("session-picker"), session: byId("session-select"),
     enterSession: byId("enter-session-button"),
+    desktopOpen: byId("desktop-open-button"),
     source: byId("source"), english: byId("english"), draftState: byId("draft-state"),
     attach: byId("attach-button"), fileInput: byId("file-input"), attachments: byId("attachment-list"),
     attachmentHint: byId("attachment-hint"), autoEnter: byId("auto-enter"),
@@ -1365,6 +1366,7 @@
   ui.newButton.addEventListener("click", () => createJob("new"));
   ui.matchCurrent?.addEventListener("click", () => createJob("match_current"));
   ui.projectsButton?.addEventListener("click", showProjects);
+  ui.desktopOpen?.addEventListener("click", () => window.open("/desktop", "_blank", "noopener"));
   ui.refreshProjects?.addEventListener("click", () => {
     if (!navigationBusy()) loadProjects(true);
   });

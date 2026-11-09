@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('remote.py', '.'), ('desktop_remote.py', '.')],
+    datas=[('remote.py', '.'), ('desktop_remote.py', '.'), ('desktop_stream.py', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

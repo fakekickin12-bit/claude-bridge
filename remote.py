@@ -390,7 +390,7 @@ def check_ready(request):
 def dispatch(request):
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     action = request.get("action")
-    if request.get("transport") == "desktop" and action in {"setup", "probe", "start", "new", "capture", "check_ready", "send", "list_projects", "project_catalog", "match_current", "open_project", "switch_project", "cleanup_attachment_draft", "delivery_status"}:
+    if request.get("transport") == "desktop" and action in {"setup", "probe", "start", "new", "capture", "check_ready", "send", "list_projects", "project_catalog", "match_current", "open_project", "switch_project", "cleanup_attachment_draft", "delivery_status", "desktop_frame", "desktop_input", "desktop_input_status", "desktop_close"}:
         import desktop_remote
         try:
             return desktop_remote.dispatch(request)

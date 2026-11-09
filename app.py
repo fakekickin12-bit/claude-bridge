@@ -20,6 +20,7 @@ from core import (APP_DIR, DATA_DIR, PRESETS, BridgeError, CodexTranslator, SSH,
                   atomic_json, delivery_fingerprint, effective_reasoning_effort, make_profile, protect_key,
                   reasoning_options, save_config, send_fingerprint, unprotect_key, validate_text)
 from media import build_bundle, check_cancel, compose_prompt, kind, upload_bundle
+from device_auth import pairing_url
 from reply_translations import IncrementalReply, ReplyCache, translation_key, translation_revision
 
 STYLE = """
@@ -836,6 +837,10 @@ class Window(QMainWindow):
             action = self.ubuntu_menu.addAction(text)
             action.triggered.connect(callback)
             self.ubuntu_actions[key] = action
+        self.utilities_menu = self.menuBar().addMenu("小工具")
+        self.desktop_web_action = self.utilities_menu.addAction("Ubuntu 远程桌面…")
+        self.desktop_web_action.setToolTip("在独立网页查看和触控 Ubuntu 当前桌面；浏览器需先登记设备。")
+        self.desktop_web_action.triggered.connect(self.open_desktop_web)
         self.history_menu = self.menuBar().addMenu("发送记录")
         self.history_action = self.history_menu.addAction("查看发送记录…")
         self.history_action.triggered.connect(self.show_history_dialog)
@@ -1274,6 +1279,15 @@ class Window(QMainWindow):
         job.signals.done.connect(success)
         job.signals.failed.connect(failure)
         QThreadPool.globalInstance().start(job)
+
+    def open_desktop_web(self):
+        try:
+            url = pairing_url(DATA_DIR).rstrip("/") + "/desktop"
+        except BridgeError as exc:
+            QMessageBox.information(self, "请先配置手机入口", str(exc))
+            return
+        if not QDesktopServices.openUrl(QUrl(url)):
+            self.statusBar().showMessage("浏览器未能打开，请从手机入口的菜单进入 Ubuntu 远程桌面。")
 
     def settings(self, section="api"):
         if self.busy:

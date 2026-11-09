@@ -20,7 +20,7 @@ LICENSE_URLS = {
     "GPL-3.0.txt": "https://www.gnu.org/licenses/gpl-3.0.txt",
 }
 BACKEND = ("core.py", "device_auth.py", "media.py", "mobile_service.py", "reply_translations.py",
-           "remote.py", "desktop_remote.py", "requirements-mobile.txt")
+           "remote.py", "desktop_remote.py", "desktop_stream.py", "requirements-mobile.txt")
 DOCS = ("README.md", "LICENSE", "SECURITY.md", "THIRD_PARTY_NOTICES.md")
 
 

@@ -496,7 +496,7 @@ p=pathlib.Path.home()/'.local/share/claude-bridge'
 p.mkdir(parents=True,exist_ok=True,mode=0o700)
 os.chmod(p,0o700)
 for name,source in r['sources'].items():
- if name not in ('remote.py','desktop_remote.py'):raise ValueError('invalid helper')
+ if name not in ('remote.py','desktop_remote.py','desktop_stream.py'):raise ValueError('invalid helper')
  fd,tmp=tempfile.mkstemp(dir=p)
  with os.fdopen(fd,'w',encoding='utf-8') as f:f.write(source)
  os.chmod(tmp,0o700)
@@ -545,7 +545,7 @@ class SSH:
         return result
 
     def install(self):
-        sources = {name: (RESOURCE_DIR / name).read_text(encoding="utf-8") for name in ["remote.py", "desktop_remote.py"]}
+        sources = {name: (RESOURCE_DIR / name).read_text(encoding="utf-8") for name in ["remote.py", "desktop_remote.py", "desktop_stream.py"]}
         self.run("python3 -c " + shlex.quote(BOOTSTRAP), {"sources": sources})
         return self.action("setup", timeout=150)
 

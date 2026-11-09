@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -34,6 +35,10 @@ WEB = Path(__file__).parent / "mobile_web"
 TERMINAL_STATES = {"translated", "pasted", "submitted", "failed", "unknown"}
 ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 MAX_UPLOAD = 256 * 1024 * 1024
+DESKTOP_KEYS = {"Return", "Enter", "Tab", "BackSpace", "Delete", "Escape", "Left", "Right", "Up", "Down",
+                "Home", "End", "Prior", "Next", "Page_Up", "Page_Down", "Shift_L+Tab", "Alt_L+Tab", "Super_L",
+                "Control_L+a", "Control_L+c", "Control_L+v", "Control_L+x", "Control_L+z", "Control_L+y", "Control_L+s",
+                "Control_L+Shift_L+z"}
 
 
 class RequestSizeLimit:
@@ -91,6 +96,61 @@ class LoginRequest(BaseModel):
     label: str = Field(default="浏览器设备", min_length=1, max_length=80, pattern=r"^[^\x00-\x1f\x7f]+$")
 
 
+class DesktopViewerRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    viewer_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class DesktopInputRequest(DesktopViewerRequest):
+    session_id: str = Field(min_length=1, max_length=200)
+    frame_id: str = Field(min_length=1, max_length=200)
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    event: dict
+
+
+class DesktopFrameRequest(DesktopViewerRequest):
+    image_hash: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+
+
+class DesktopStatusRequest(DesktopViewerRequest):
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    fingerprint: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+
+
+def desktop_event(value):
+    """Small, explicit input vocabulary; no command, filename or arbitrary key."""
+    if not isinstance(value, dict):
+        raise HTTPException(400, "桌面操作无效。")
+    kind = value.get("kind")
+    allowed = {"click": {"kind", "x", "y", "button", "clicks"},
+               "scroll": {"kind", "x", "y", "delta_x", "delta_y"},
+               "drag": {"kind", "x", "y", "to_x", "to_y", "button"},
+               "text": {"kind", "text"}, "key": {"kind", "key"}}
+    if not isinstance(kind, str) or kind not in allowed or set(value) != allowed[kind]:
+        raise HTTPException(400, "桌面操作参数无效。")
+    if kind in {"click", "scroll", "drag"}:
+        for name in ("x", "y", "to_x", "to_y") if kind == "drag" else ("x", "y"):
+            coordinate = value[name]
+            if isinstance(coordinate, bool) or not isinstance(coordinate, (int, float)) or not 0 <= coordinate <= 1:
+                raise HTTPException(400, "点击位置不在桌面画面内。")
+    if kind in {"click", "drag"} and (type(value["button"]) is not int or value["button"] not in ({1} if kind == "drag" else {1, 2, 3})):
+        raise HTTPException(400, "鼠标按键无效。")
+    if kind == "click" and (type(value["clicks"]) is not int or value["clicks"] not in {1, 2}):
+        raise HTTPException(400, "点击次数无效。")
+    if kind == "scroll" and any(type(value[name]) is not int or not -1200 <= value[name] <= 1200 for name in ("delta_x", "delta_y")):
+        raise HTTPException(400, "滚动幅度无效。")
+    if kind == "text" and (not isinstance(value["text"], str) or not value["text"] or len(value["text"]) > 20000 or "\x00" in value["text"]):
+        raise HTTPException(400, "输入文字需要在 1 到 20000 字符之间。")
+    if kind == "text":
+        try:
+            value["text"].encode("utf-8")
+        except UnicodeError:
+            raise HTTPException(400, "输入文字编码无效。") from None
+    if kind == "key" and (not isinstance(value["key"], str) or value["key"] not in DESKTOP_KEYS):
+        raise HTTPException(400, "暂不支持这个快捷键。")
+    return dict(value)
+
+
 @contextmanager
 def service_instance(data_dir):
     directory = Path(data_dir) / "mobile"
@@ -127,6 +187,7 @@ class MobileBridge:
         self.translator_factory = translator_factory
         self.lock = threading.RLock()
         self.remote_lock = threading.Lock()
+        self.desktop_frame_lock = threading.Lock()
         self.event = threading.Event()
         self.stop_event = threading.Event()
         self.threads = []
@@ -140,6 +201,7 @@ class MobileBridge:
         self.code_blocks = []
         self.reply_cache = ReplyCache(self.data_dir / "reply-translations")
         self.reply_streams = {}
+        self.desktop_viewers = {}
         self.login_failures = deque()
         self.project_catalog = {"projects": [], "loading": False, "reason": ""}
         self.projects_initialized = False
@@ -160,10 +222,15 @@ class MobileBridge:
                 CREATE TABLE IF NOT EXISTS uploads (
                     id TEXT PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS reply_attempts (key TEXT PRIMARY KEY, error TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS desktop_inputs (
+                    id TEXT PRIMARY KEY, device_id TEXT NOT NULL, viewer_id TEXT NOT NULL,
+                    connection_revision TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
+                    result TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
             """)
             create_device_tables(db)
             db.execute("UPDATE jobs SET state='unknown', error=?, updated_at=? WHERE state='running'",
                        ("后台曾在操作中重启，请检查 Ubuntu 和发送记录后再决定下一步。", time.time()))
+            db.execute("UPDATE desktop_inputs SET state='unknown',updated_at=? WHERE state='pending'", (time.time(),))
 
     @contextmanager
     def database(self):
@@ -191,6 +258,199 @@ class MobileBridge:
             return core.CodexTranslator(profile)
         key = core.unprotect_key(profile.get("key_encrypted", "")) or os.environ.get(profile.get("key_env", ""), "")
         return core.Translator(profile, key)
+
+    def desktop_connection(self):
+        connection = dict(self.config()["ssh"])
+        revision = hashlib.sha256(json.dumps(connection, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        return connection, revision
+
+    def desktop_viewer(self, device_id, viewer_id, *, create=False):
+        connection, revision = self.desktop_connection()
+        now = time.monotonic()
+        with self.lock:
+            for identifier, entry in list(self.desktop_viewers.items()):
+                if now - entry["seen"] > 120:
+                    self.desktop_viewers.pop(identifier, None)
+            entry = self.desktop_viewers.get(viewer_id)
+            if entry is None:
+                if not create:
+                    raise HTTPException(409, "桌面查看已结束，请重新打开。")
+                if len(self.desktop_viewers) >= 32:
+                    raise HTTPException(429, "打开的桌面画面较多，请先关闭其他画面。")
+                entry = {"device_id": device_id, "connection_revision": revision, "seen": now,
+                         "closed": False, "session_id": "", "frames": {}, "input_epoch": 0}
+                self.desktop_viewers[viewer_id] = entry
+            if entry["device_id"] != device_id:
+                raise HTTPException(403, "这个桌面画面不属于当前设备。")
+            if entry["closed"] or entry["connection_revision"] != revision:
+                raise HTTPException(409, "桌面连接已结束或已变化，请重新打开。")
+            entry["seen"] = now
+            return entry, connection, revision
+
+    def desktop_frame(self, device_id, viewer_id, image_hash=""):
+        entry, connection, revision = self.desktop_viewer(device_id, viewer_id, create=True)
+        with self.lock:
+            input_epoch = entry["input_epoch"]
+        # Reading pixels does not take over focus. Keep it independent from the
+        # comparatively slow Claude accessibility read and foreground job queue.
+        if not self.desktop_frame_lock.acquire(blocking=False):
+            raise HTTPException(409, "正在读取桌面画面，请稍后刷新。")
+        try:
+            frame = self.ssh_factory(connection).action("desktop_frame", viewer_id=viewer_id, timeout=30)
+            if not isinstance(frame, dict) or frame.get("mime") != "image/jpeg":
+                raise core.BridgeError("Ubuntu 未返回有效的桌面画面。")
+            image = frame.get("image_base64", "")
+            if not isinstance(image, str) or not image or len(image) > 1400000:
+                raise core.BridgeError("桌面画面过大或无效。")
+            try:
+                raw = base64.b64decode(image, validate=True)
+            except (ValueError, TypeError):
+                raise core.BridgeError("桌面画面编码无效。") from None
+            if len(raw) > 1024 * 1024 or not raw.startswith(b"\xff\xd8\xff"):
+                raise core.BridgeError("桌面图片格式无效。")
+            for name, maximum in (("width", 1600), ("height", 1600), ("desktop_width", 32768), ("desktop_height", 32768)):
+                if type(frame.get(name)) is not int or not 1 <= frame[name] <= maximum:
+                    raise core.BridgeError("桌面画面尺寸无效。")
+            for name in ("session_id", "frame_id"):
+                if not isinstance(frame.get(name), str) or not 1 <= len(frame[name]) <= 200:
+                    raise core.BridgeError("桌面画面标识无效。")
+            captured, expires = frame.get("captured_at"), frame.get("expires_at")
+            if (isinstance(captured, bool) or isinstance(expires, bool) or not isinstance(captured, (int, float))
+                    or not isinstance(expires, (int, float)) or not 0 < expires - captured <= 60):
+                raise core.BridgeError("桌面画面时间无效。")
+            if expires <= time.time() or captured > time.time() + 60:
+                raise core.BridgeError("桌面画面已过期，请重新读取。")
+            if self.desktop_connection()[1] != revision:
+                raise HTTPException(409, "Ubuntu 连接已变化，请重新打开桌面。")
+            with self.lock:
+                if (entry["closed"] or self.desktop_viewers.get(viewer_id) is not entry
+                        or entry["input_epoch"] != input_epoch):
+                    raise HTTPException(409, "桌面查看已结束。")
+                if entry["session_id"] != frame["session_id"]:
+                    entry["frames"].clear()
+                entry["session_id"] = frame["session_id"]
+                entry["frames"][frame["frame_id"]] = {"session_id": frame["session_id"],
+                    "expires": time.monotonic() + min(45, expires - time.time())}
+                while len(entry["frames"]) > 3:
+                    entry["frames"].pop(next(iter(entry["frames"])))
+            response = {name: frame[name] for name in ("session_id", "frame_id", "captured_at", "expires_at", "mime",
+                "image_base64", "width", "height", "desktop_width", "desktop_height")}
+            current_hash = hashlib.sha256(raw).hexdigest()
+            response.update(image_hash=current_hash, unchanged=bool(image_hash and hmac.compare_digest(image_hash, current_hash)))
+            if response["unchanged"]:
+                response["image_base64"] = ""
+            return response
+        finally:
+            self.desktop_frame_lock.release()
+
+    @staticmethod
+    def desktop_receipt(result, request_id, fingerprint):
+        if (isinstance(result, dict) and result.get("request_id") == request_id and result.get("fingerprint") == fingerprint
+                and result.get("matched") is True and result.get("completed") is True
+                and result.get("state") in {"applied", "not_applied"}):
+            return {"request_id": request_id, "fingerprint": fingerprint, "state": result["state"],
+                    "completed": True, "matched": True, "refresh_required": True,
+                    "reason": str(result.get("reason", ""))[:500]}
+        return {"request_id": request_id, "fingerprint": fingerprint, "state": "unknown", "completed": False,
+                "matched": False, "refresh_required": True,
+                "reason": "操作结果尚未确认，请刷新画面并查询本次结果，不会自动重做。"}
+
+    def save_desktop_receipt(self, request_id, result):
+        with self.database() as db:
+            db.execute("UPDATE desktop_inputs SET state=?,result=?,updated_at=? WHERE id=?",
+                       (result["state"], json.dumps(result, ensure_ascii=False), time.time(), request_id))
+        return result
+
+    def desktop_input(self, device_id, payload):
+        event = desktop_event(payload["event"])
+        fingerprint = hashlib.sha256(json.dumps([payload["viewer_id"], payload["session_id"], payload["frame_id"], event],
+                                                ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        with self.database() as db:
+            previous = db.execute("SELECT * FROM desktop_inputs WHERE id=?", (payload["request_id"],)).fetchone()
+        if previous:
+            if previous["device_id"] != device_id:
+                raise HTTPException(403, "这次桌面操作不属于当前设备。")
+            if previous["fingerprint"] != fingerprint or previous["viewer_id"] != payload["viewer_id"]:
+                raise HTTPException(409, "原操作编号的内容已变化，不会再次执行。")
+            return json.loads(previous["result"]) if previous["result"] else self.desktop_receipt(None, payload["request_id"], fingerprint)
+        entry, connection, revision = self.desktop_viewer(device_id, payload["viewer_id"])
+        with self.lock:
+            frame = entry["frames"].get(payload["frame_id"])
+            if not frame or frame["session_id"] != payload["session_id"] or time.monotonic() >= frame["expires"]:
+                raise HTTPException(409, "画面已过期，请刷新后再操作。")
+        if not self.remote_lock.acquire(blocking=False):
+            raise HTTPException(409, "Ubuntu 正在处理 Bridge 操作，本次桌面输入尚未执行。")
+        try:
+            with self.lock:
+                if entry["closed"] or entry["frames"].get(payload["frame_id"]) is not frame or time.monotonic() >= frame["expires"]:
+                    raise HTTPException(409, "桌面画面已结束或过期，本次输入尚未执行。")
+            if self.desktop_connection()[1] != revision:
+                raise HTTPException(409, "Ubuntu 连接已变化，本次桌面输入尚未执行。")
+            with self.database() as db:
+                db.execute("BEGIN IMMEDIATE")
+                previous = db.execute("SELECT * FROM desktop_inputs WHERE id=?", (payload["request_id"],)).fetchone()
+                if previous:
+                    if previous["device_id"] != device_id or previous["fingerprint"] != fingerprint:
+                        raise HTTPException(409, "桌面操作编号已使用。")
+                    return json.loads(previous["result"]) if previous["result"] else self.desktop_receipt(None, payload["request_id"], fingerprint)
+                db.execute("INSERT INTO desktop_inputs(id,device_id,viewer_id,connection_revision,fingerprint,state,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?)",
+                    (payload["request_id"], device_id, payload["viewer_id"], revision, fingerprint, time.time(), time.time()))
+            with self.lock:
+                entry["input_epoch"] += 1
+                entry["frames"].clear()
+            try:
+                result = self.ssh_factory(connection).action("desktop_input", viewer_id=payload["viewer_id"],
+                    session_id=payload["session_id"], frame_id=payload["frame_id"], request_id=payload["request_id"], event=event, timeout=25)
+            except Exception:
+                result = None
+            return self.save_desktop_receipt(payload["request_id"], self.desktop_receipt(result, payload["request_id"], fingerprint))
+        finally:
+            self.remote_lock.release()
+
+    def desktop_status(self, device_id, payload):
+        with self.database() as db:
+            row = db.execute("SELECT * FROM desktop_inputs WHERE id=?", (payload["request_id"],)).fetchone()
+        if row is None:
+            return self.desktop_receipt(None, payload["request_id"], payload["fingerprint"])
+        if row["device_id"] != device_id or row["viewer_id"] != payload["viewer_id"]:
+            raise HTTPException(403, "这次桌面操作不属于当前设备。")
+        if payload["fingerprint"] and row["fingerprint"] != payload["fingerprint"]:
+            raise HTTPException(409, "桌面操作指纹不匹配。")
+        payload = {**payload, "fingerprint": row["fingerprint"]}
+        if row["state"] in {"applied", "not_applied"} and row["result"]:
+            return json.loads(row["result"])
+        connection, revision = self.desktop_connection()
+        if row["connection_revision"] != revision or not self.remote_lock.acquire(blocking=False):
+            return self.desktop_receipt(None, payload["request_id"], payload["fingerprint"])
+        try:
+            try:
+                result = self.ssh_factory(connection).action("desktop_input_status", viewer_id=payload["viewer_id"],
+                    request_id=payload["request_id"], fingerprint=payload["fingerprint"], timeout=15)
+            except Exception:
+                result = None
+            return self.save_desktop_receipt(payload["request_id"], self.desktop_receipt(result, payload["request_id"], payload["fingerprint"]))
+        finally:
+            self.remote_lock.release()
+
+    def desktop_close(self, device_id, viewer_id):
+        with self.lock:
+            entry = self.desktop_viewers.get(viewer_id)
+            if entry and entry["device_id"] != device_id:
+                raise HTTPException(403, "这个桌面画面不属于当前设备。")
+            if entry:
+                entry["closed"] = True
+                entry["frames"].clear()
+        if entry and self.remote_lock.acquire(blocking=False):
+            try:
+                connection, revision = self.desktop_connection()
+                if entry["connection_revision"] == revision:
+                    try:
+                        self.ssh_factory(connection).action("desktop_close", viewer_id=viewer_id, timeout=10)
+                    except Exception:
+                        pass
+            finally:
+                self.remote_lock.release()
+        return {"closed": True}
 
     def job(self, job_id):
         with self.database() as db:
@@ -888,9 +1148,11 @@ class MobileBridge:
                     active = self.active_job
                     translating_reply = self.active_job_action == "translate_reply"
                     recent = time.monotonic() - self.last_seen < 45
+                    desktop_active = any(not entry["closed"] and time.monotonic() - entry["seen"] < 45
+                                         for entry in self.desktop_viewers.values())
                 if self.projects_requested.is_set() and active is None:
                     self.fetch_projects()
-                elif recent and (active is None or translating_reply):
+                elif recent and not desktop_active and (active is None or translating_reply):
                     self.capture()
                 self.capture_wake.wait(5)
                 self.capture_wake.clear()
@@ -1036,6 +1298,26 @@ def create_app(data_dir, public_origin, *, start_worker=True, bridge=None):
         session(request)
         return {"jobs": service.history()}
 
+    @app.post("/api/desktop/frame")
+    def desktop_frame(payload: DesktopFrameRequest, request: Request):
+        session(request, mutation=True)
+        return service.desktop_frame(request.state.device["id"], payload.viewer_id, payload.image_hash)
+
+    @app.post("/api/desktop/input")
+    def desktop_input(payload: DesktopInputRequest, request: Request):
+        session(request, mutation=True)
+        return service.desktop_input(request.state.device["id"], payload.model_dump())
+
+    @app.post("/api/desktop/status")
+    def desktop_status(payload: DesktopStatusRequest, request: Request):
+        session(request, mutation=True)
+        return service.desktop_status(request.state.device["id"], payload.model_dump())
+
+    @app.post("/api/desktop/close")
+    def desktop_close(payload: DesktopViewerRequest, request: Request):
+        session(request, mutation=True)
+        return service.desktop_close(request.state.device["id"], payload.viewer_id)
+
     @app.get("/api/projects")
     def projects(request: Request, refresh: bool = False):
         session(request)
@@ -1092,9 +1374,15 @@ def create_app(data_dir, public_origin, *, start_worker=True, bridge=None):
     def index():
         return FileResponse(WEB / "index.html", headers={"Cache-Control": "no-cache"})
 
+    @app.get("/desktop")
+    def desktop_page():
+        # The shell contains no screen data. Its protected APIs handle expired
+        # cookies so the page can offer a return link for device registration.
+        return FileResponse(WEB / "desktop.html", headers={"Cache-Control": "no-cache"})
+
     @app.get("/{asset}")
     def asset(asset: str):
-        if asset not in {"app.css", "app.js", "manifest.webmanifest", "icon.svg", "sw.js"} or not (WEB / asset).is_file():
+        if asset not in {"app.css", "app.js", "desktop.css", "desktop.js", "manifest.webmanifest", "icon.svg", "sw.js"} or not (WEB / asset).is_file():
             raise HTTPException(404)
         return FileResponse(WEB / asset, headers={"Cache-Control": "no-cache"})
 
