@@ -30,7 +30,7 @@ gate = threading.Event()
 reads = []
 class ReadClient:
     def __init__(self, config): self.target = dict(config)
-    def action(self, action):
+    def action(self, action, **kwargs):
         assert action == "capture"
         reads.append(self.target)
         index = len(reads)
@@ -88,7 +88,7 @@ with patch("app.SSH", ReadClient), patch.object(window, "accept_reply", wraps=wi
 
 # A failed automatic read stays quiet and keeps editing available.
 class FailedClient(ReadClient):
-    def action(self, action):
+    def action(self, action, **kwargs):
         from core import BridgeError
         raise BridgeError("Synthetic read failure")
 with patch("app.SSH", FailedClient), patch("app.QMessageBox.warning") as warning:
@@ -96,7 +96,8 @@ with patch("app.SSH", FailedClient), patch("app.QMessageBox.warning") as warning
     window.auto_refresh.setChecked(True)
     window.refresh(quiet=True)
     settle(lambda: window.capture_job is None)
-    assert not warning.called and not window.auto_refresh.isChecked()
+    assert not warning.called and window.auto_refresh.isChecked()
+    assert "读取未完成" in window.reply_translation_status.text()
     assert window.settings_actions["api"].isEnabled() and window.badge.text() == "保留前台状态"
 
 # Closing during a read is allowed; its late result cannot update the closed window.

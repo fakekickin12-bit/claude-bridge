@@ -32,6 +32,7 @@ jobs:
           python tests/settings_reasoning_ui.py
           python tests/settings_devices_ui.py
           python tests/desktop_match_ui.py
+          python tests/desktop_reply_read_ui.py
       - name: Mobile UI
         run: |
           node tests/mobile_reply_ui.js
@@ -50,6 +51,7 @@ jobs:
       - name: Synthetic accessibility tests
         run: |
           python tests/desktop_checks.py
+          python tests/desktop_latest_checks.py
           python tests/desktop_capture_checks.py
           python tests/desktop_projects_checks.py
           python tests/desktop_match_checks.py

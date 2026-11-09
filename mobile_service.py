@@ -141,6 +141,9 @@ class MobileBridge:
         self.projects_initialized = False
         self.projects_requested = threading.Event()
         self.capture_wake = threading.Event()
+        self.last_target_probe = 0.0
+        self.target_probe_context = ""
+        self.target_probe_connection = ""
         self.receipt_due = {}
         self.receipt_lock = threading.Lock()
         self.receipt_event = threading.Event()
@@ -417,31 +420,82 @@ class MobileBridge:
         if not self.remote_lock.acquire(blocking=False):
             return
         try:
-            client = self.ssh_factory(self.config()["ssh"])
-            target = client.action("probe", timeout=90)
-            reply = client.action("capture", context=target.get("context"), timeout=60)
-            safe_target = self.safe_target(target)
-            if reply.get("context") != safe_target.get("context") or not reply.get("context"):
-                raise core.BridgeError("Ubuntu 会话已变化，正在重新读取当前对话。")
+            connection = dict(self.config()["ssh"])
+            connection_key = json.dumps(connection, ensure_ascii=False, sort_keys=True)
+            client = self.ssh_factory(connection)
+            # The reply identifies its own page before/after reading. Do not put
+            # a full composer/readiness scan in front of the lightweight read.
+            reply = client.action("capture", timeout=45)
+            context = reply.get("context")
+            if not isinstance(context, str) or not re.fullmatch(r"[0-9a-f]{64}", context):
+                raise core.BridgeError("回复所属会话尚未确认，请重新读取。")
+            if connection != self.config()["ssh"]:
+                raise core.BridgeError("Ubuntu 连接设置已变化，正在重新读取。")
             with self.lock:
-                if self.target.get("context") == safe_target.get("context"):
-                    for key in ("project_title", "session_title"):
-                        if self.target.get(key) and not safe_target.get(key):
-                            safe_target[key] = self.target[key]
-                self.target = safe_target
+                previous_generating = bool(self.reply.get("generating"))
+                if self.target.get("context") != context or self.target_probe_connection != connection_key:
+                    self.target = self.safe_target({"context": context, "mode": reply.get("mode"),
+                        "title": reply.get("title", "当前会话"), "ready": False,
+                        "reason": "最新回复已读取，正在确认输入状态…"})
+                elif reply.get("generating"):
+                    self.target = {**self.target, "ready": False, "busy": True, "reason": "Claude 正在回复"}
                 if (self.project_catalog.get("context")
-                        and self.project_catalog["context"] != safe_target.get("context")):
+                        and self.project_catalog["context"] != context):
                     self.project_catalog = {"projects": [], "loading": False, "reason": ""}
                     self.projects_initialized = False
-                self.accept_capture(reply, safe_target["context"])
+                self.accept_capture(reply, context)
+                need_probe = (self.target_probe_context != context
+                              or self.target_probe_connection != connection_key
+                              or time.monotonic() - self.last_target_probe >= 30
+                              or previous_generating and not reply.get("generating"))
+            if not need_probe:
+                return
+            self.last_target_probe = time.monotonic()
+            self.target_probe_context = context
+            self.target_probe_connection = connection_key
+            try:
+                target = client.action("probe", timeout=30)
+                safe_target = self.safe_target(target)
+                if not isinstance(safe_target.get("context"), str) or not re.fullmatch(r"[0-9a-f]{64}", safe_target["context"]):
+                    raise core.BridgeError("输入状态所属会话未确认。")
+                if connection != self.config()["ssh"]:
+                    raise core.BridgeError("Ubuntu 连接设置已变化，正在重新读取。")
+                with self.lock:
+                    if self.target.get("context") == safe_target.get("context"):
+                        for key in ("project_title", "session_title"):
+                            if self.target.get(key) and not safe_target.get(key):
+                                safe_target[key] = self.target[key]
+                    self.target = safe_target
+                    if safe_target["context"] != context:
+                        # A newer native page wins; never put the already read
+                        # reply beneath the newly observed conversation title.
+                        self.reply = {"text": "", "source_hash": "", "mode": safe_target.get("mode", ""),
+                                      "context": safe_target["context"], "loading": True, "generating": False,
+                                      "updated_at": 0, "error": "", "read_status": "loading"}
+                        self.code_blocks = []
+                        self.target_probe_context = ""
+                        self.capture_wake.set()
+            except Exception:
+                with self.lock:
+                    self.target = {**self.target, "ready": False,
+                                   "reason": "最新回复已读取；输入状态暂未确认，正在重新连接。"}
+            finally:
+                self.last_target_probe = time.monotonic()
         except core.BridgeError as exc:
-            with self.lock:
-                self.target = {"ready": False, "reason": str(exc)}
+            self.capture_failed(str(exc))
         except Exception:
-            with self.lock:
-                self.target = {"ready": False, "reason": "暂时无法读取 Ubuntu 状态，正在重新连接。"}
+            self.capture_failed("暂时无法读取 Ubuntu 最新回复，正在重新连接。")
         finally:
             self.remote_lock.release()
+
+    def capture_failed(self, message):
+        with self.lock:
+            self.target = {**self.target, "ready": False, "reason": message}
+            self.reply = {"text": "", "source_hash": "", "mode": self.reply.get("mode", ""),
+                          "context": self.target.get("context", ""), "loading": False, "generating": False,
+                          "updated_at": 0, "error": message, "read_status": "error", "read_reason": message}
+            self.code_blocks = []
+            self.target_probe_context = ""
 
     def accept_capture(self, reply, expected_context):
         if not expected_context or reply.get("context") != expected_context:
@@ -450,7 +504,9 @@ class MobileBridge:
         with self.lock:
             self.reply = {"text": raw, "source_hash": hashlib.sha256(raw.encode()).hexdigest() if raw else "",
                           "mode": reply.get("mode", ""), "context": expected_context, "loading": False,
-                          "generating": bool(reply.get("generating")), "updated_at": time.time()}
+                          "generating": bool(reply.get("generating")), "updated_at": time.time(), "error": "",
+                          "read_status": reply.get("read_status") or ("ready" if raw else "empty"),
+                          "read_reason": reply.get("read_reason", ""), "scope": "latest"}
             self.code_blocks = [value for value in reply.get("code_blocks", []) if isinstance(value, str)]
 
     def translate_reply(self, payload):
@@ -541,6 +597,8 @@ class MobileBridge:
                     result = {**result, "target": target}
                     with self.lock:
                         self.target = target
+                        self.target_probe_connection = json.dumps(config["ssh"], ensure_ascii=False, sort_keys=True)
+                        self.target_probe_context = ""
                         self.reply["context"] = context
                         self.project_catalog = {"projects": [], "loading": False, "reason": ""}
                         self.projects_initialized = False
@@ -548,7 +606,8 @@ class MobileBridge:
                     try:
                         reply = client.action("capture", context=context, timeout=60)
                         self.accept_capture(reply, context)
-                    except Exception:
+                    except Exception as exc:
+                        self.capture_failed(str(exc) if isinstance(exc, core.BridgeError) else "当前对话已匹配，但最新回复读取未完成，请刷新重试。")
                         result = {**result, "reply_loading": True}
                     self.update_job(job_id, "submitted", "已匹配当前对话", result)
                     return True
@@ -576,12 +635,15 @@ class MobileBridge:
                                           "loading": True, "generating": False, "updated_at": 0}
                             self.code_blocks = []
                             self.target = self.safe_target(result["target"])
+                            self.target_probe_connection = json.dumps(config["ssh"], ensure_ascii=False, sort_keys=True)
+                            self.target_probe_context = ""
                     if read_reply:
                         self.update_job(job_id, "running", "正在读取所选项目的最近对话", result)
                         try:
                             reply = client.action("capture", context=context, timeout=60)
                             self.accept_capture(reply, context)
-                        except Exception:
+                        except Exception as exc:
+                            self.capture_failed(str(exc) if isinstance(exc, core.BridgeError) else "已进入会话，但最新回复读取未完成，请刷新重试。")
                             result = {**result, "reply_loading": True}
                     phase = "已打开项目最近对话" if action == "open_project" else "已切换会话" if result.get("switched") else "已读取项目会话"
                     self.update_job(job_id, "submitted", phase, result)

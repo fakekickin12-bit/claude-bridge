@@ -965,19 +965,26 @@
   function renderReply() {
     const matched = currentReply();
     const reply = matched || {};
+    const reading = serverState?.reply || {};
+    const readingContextMatches = (!replyNavigation?.context || reading.context === replyNavigation.context) &&
+      (!reading.context || !serverState?.target?.context || reading.context === serverState.target.context);
+    const readError = readingContextMatches ? reading.error || (reading.read_status === "error" ? reading.read_reason : "") || "" : "";
     const key = replyKey();
     const translated = translatedReplies.get(key);
     const original = typeof reply.text === "string" ? reply.text : "";
     let content = original;
-    let status = matched ? "" : replyNavigation?.action === "match_current" ? "正在读取 Ubuntu 当前对话的最新回复…" : "正在读取所选会话的最新回复…";
-    if (replyTranslated && original) {
+    let status = readError || (reply.loading ? "正在读取最后一条 Claude 回复…" :
+      matched ? "" : replyNavigation?.action === "match_current" ? "正在读取 Ubuntu 当前对话的最新回复…" : "正在读取所选会话的最新回复…");
+    if (!readError && replyTranslated && original) {
       if (translated) content = translated;
       else if (!serverState?.worker?.online) status = "电脑连接恢复后翻译";
       else if (reply.generating) status = "回复完成后自动翻译";
       else if (replyFailures.has(key)) status = replyFailures.get(key);
       else status = pendingReplyJob?.key === key ? "正在翻译回复…" : "等待翻译回复";
-    } else if (reply.generating) {
+    } else if (!readError && reply.generating) {
       status = "Claude 正在回复…";
+    } else if (!readError && reply.read_status === "empty") {
+      status = reply.read_reason || "当前会话还没有 Claude 回复。";
     }
     ui.replyHeading.textContent = (reply.mode || serverState?.target?.mode) === "Code" ? "Claude Code 回复" : "Claude 回复";
     const replyBody = ui.replyText.parentElement;
@@ -987,7 +994,9 @@
       if (atEnd) replyBody.scrollTop = replyBody.scrollHeight;
     }
     ui.replyEmpty.hidden = Boolean(content);
-    ui.replyEmpty.textContent = matched ? "当前会话的最新回复会显示在这里。" : "正在确认所选会话的回复…";
+    ui.replyEmpty.textContent = readError || (reply.loading ? "正在读取最后一条 Claude 回复…" :
+      reply.read_status === "empty" ? reply.read_reason || "当前会话还没有 Claude 回复。" :
+      matched ? "当前会话的最新回复会显示在这里。" : "正在确认所选会话的回复…");
     ui.replyText.hidden = !content;
     ui.replyStatus.textContent = status;
     ui.replyToggle.setAttribute("aria-pressed", String(replyTranslated));
@@ -999,7 +1008,7 @@
   async function ensureReplyTranslation() {
     const reply = currentReply();
     const key = replyKey();
-    if (!authenticated || !connected || !serverState?.worker?.online || document.hidden || !replyTranslated || !reply?.text || !key || reply.generating ||
+    if (!authenticated || !connected || !serverState?.worker?.online || document.hidden || !replyTranslated || !reply?.text || !key || reply.generating || reply.loading || reply.error ||
         pendingReplyJob || pendingJob || posting || serverState?.worker?.busy ||
         translatedReplies.has(key) || replyFailures.has(key) || requestedReplies.has(key)) return;
     const id = makeId();

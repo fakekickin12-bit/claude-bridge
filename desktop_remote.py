@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -1009,53 +1009,188 @@ def reply_content(node, depth=0):
         return ""
 
 
+class ReplyReadLimit(DesktopError):
+    pass
+
+
+REPLY_CONTAINER_LIMIT = 512
+REPLY_ARTICLE_LIMIT = 64
+REPLY_BODY_LIMIT = 12000
+REPLY_BODY_SECONDS = 8
+REPLY_LEAF_ROLES = {"static", "text", "link", "image", "icon", "separator"}
+REPLY_BODY_ROLES = REPLY_LEAF_ROLES | {"paragraph", "heading", "table", "table row", "list", "list item"}
+
+
+def message_feed(node, role=None, attrs=None):
+    role = role if role is not None else node.getRoleName()
+    attrs = attrs if attrs is not None else node_attributes(node)
+    return ("feed" in attrs.get("xml-roles", "").split()
+            or role in {"panel", "landmark"} and node.name == "Chat messages")
+
+
+def reply_metadata_nodes(root, *, reverse=False, prune_feeds=False, limit=REPLY_CONTAINER_LIMIT):
+    """Bounded structural reads; message articles and semantic bodies are never expanded."""
+    remaining = [limit]
+
+    def visit(node, depth):
+        if node is None:
+            return
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 32:
+            raise ReplyReadLimit("当前消息列表结构较复杂，未读取历史正文；请稍后重试最后一条回复。")
+        role, attrs = node.getRoleName(), node_attributes(node)
+        yield node, role, attrs
+        if (role == "article" or "group/message-row" in attrs.get("class", "").split()
+                or role in REPLY_BODY_ROLES or role in {
+                "push button", "toggle button", "entry", "menu", "menu item", "tool bar"}
+                or "sr-only" in attrs.get("class", "").split()
+                or prune_feeds and message_feed(node, role, attrs)):
+            return
+        count = node.childCount
+        indices = range(count - 1, -1, -1) if reverse else range(count)
+        for index in indices:
+            child = node.getChildAtIndex(index)
+            if child is not None:
+                yield from visit(child, depth + 1)
+
+    yield from visit(root, 0)
+
+
+def assistant_article(article):
+    """Inspect only shallow native speaker metadata, never a user's body heading."""
+    remaining = [24]
+
+    def identify(node, depth):
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 5:
+            return None
+        role, attrs = node.getRoleName(), node_attributes(node)
+        classes = attrs.get("class", "").split()
+        if "group/message-row" in classes:
+            return True
+        if role == "heading" and "sr-only" in classes:
+            name = node.name
+            if name in {"Claude responded", "Claude said"} or name.startswith(("Claude responded:", "Claude said:")):
+                return True
+            if name in {"You said", "You asked"} or name.startswith(("You said:", "You asked:")):
+                return False
+            return None
+        if role in REPLY_BODY_ROLES or role in {"push button", "toggle button", "entry", "tool bar"}:
+            return None
+        for index in range(min(node.childCount, 24)):
+            result = identify(node.getChildAtIndex(index), depth + 1)
+            if result is not None:
+                return result
+        return None
+
+    return identify(article, 0) is True
+
+
+def latest_reply_content(article):
+    """Extract one selected article and its code blocks in a single bounded pass."""
+    remaining, deadline, code = [REPLY_BODY_LIMIT], time.monotonic() + REPLY_BODY_SECONDS, []
+
+    def read(node, depth=0):
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 65 or time.monotonic() > deadline:
+            raise ReplyReadLimit("最后一条回复内容较多，读取尚未完成；请稍后刷新，不会扫描历史回复。")
+        role, attrs = node.getRoleName(), node_attributes(node)
+        classes, tag = attrs.get("class", "").split(), attrs.get("tag", "")
+        if "sr-only" in classes or "group/status" in classes or role in {
+                "tool bar", "status bar", "push button", "toggle button", "entry", "menu", "menu item"} or tag in {"button", "time"}:
+            return ""
+        if tag == "br":
+            return "\n"
+        count = node.childCount
+        if count > remaining[0]:
+            raise ReplyReadLimit("最后一条回复内容较多，读取尚未完成；请稍后刷新，不会扫描历史回复。")
+        parts = [read(node.getChildAtIndex(index), depth + 1) for index in range(count)]
+        body = "".join(parts) if parts else node.name if role in {"static", "text", "link", "image"} else ""
+        if tag == "pre" and body.strip("\n"):
+            code.append(body.strip("\n"))
+        if role == "table row" or tag == "tr":
+            return "\t".join(part.strip() for part in parts) + "\n"
+        if role == "list item" or tag == "li":
+            return "• " + body.strip() + "\n"
+        if tag in {"p", "pre", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "table"} or role == "paragraph":
+            return body.rstrip("\n") + "\n\n" if body else ""
+        return body
+
+    try:
+        body = read(article).strip("\n")
+    except ReplyReadLimit:
+        raise
+    except Exception:
+        raise DesktopError("最后一条回复读取未完成，请稍后刷新。") from None
+    return body, code
+
+
+def direct_reply_payload(row):
+    """Ignore Code's footer/status-only rows without reading any accessible body names."""
+    remaining = [128]
+
+    def content(node, depth):
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 12:
+            raise ReplyReadLimit("最后一条回复结构尚未载入，请稍后刷新。")
+        role, attrs = node.getRoleName(), node_attributes(node)
+        classes, tag = attrs.get("class", "").split(), attrs.get("tag", "")
+        if "sr-only" in classes or "group/status" in classes or role in {
+                "tool bar", "status bar", "push button", "toggle button", "entry", "menu", "menu item"} or tag in {"button", "time"}:
+            return False
+        if role in REPLY_BODY_ROLES or tag in {"p", "pre", "blockquote", "ul", "ol", "table"}:
+            return True
+        for index in range(node.childCount):
+            if content(node.getChildAtIndex(index), depth + 1):
+                return True
+        return False
+
+    return content(row, 0)
+
+
 def latest_reply(page):
-    feeds = []
-    for node in walk(page):
-        try:
-            if node.name == "Chat messages" or "feed" in node_attributes(node).get("xml-roles", "").split():
-                feeds.append(node)
-        except Exception:
-            pass
-    if len(feeds) != 1:
-        return {"text": "", "reply_count": 0, "code_blocks": []}
-    replies = []
-    for article in walk(feeds[0]):
-        try:
-            if article.getRoleName() != "article":
+    empty = {"text": "", "reply_count": 0, "code_blocks": [], "scope": "latest", "read_status": "empty"}
+    try:
+        feeds = [node for node, role, attrs in reply_metadata_nodes(page, reverse=True, prune_feeds=True)
+                 if message_feed(node, role, attrs)]
+        if len(feeds) != 1:
+            return {**empty, "read_status": "unavailable", "read_reason": "当前会话的消息列表尚未载入，请稍后刷新。"}
+        found = 0
+        for node, role, attrs in reply_metadata_nodes(feeds[0], reverse=True):
+            direct_row = "group/message-row" in attrs.get("class", "").split()
+            if role != "article" and not direct_row:
                 continue
-            assistant = False
-            for child in walk(article):
-                if child.getRoleName() == "heading" and (
-                        child.name in {"Claude responded", "Claude said"} or
-                        child.name.startswith(("Claude responded:", "Claude said:"))):
-                    assistant = True
-                    break
-                if "group/message-row" in node_attributes(child).get("class", "").split():
-                    assistant = True
-                    break
-            if assistant:
-                body = reply_content(article).strip("\n")
-                if body:
-                    code = [reply_content(n).strip("\n") for n in walk(article) if node_attributes(n).get("tag") == "pre"]
-                    replies.append({"text": body, "code_blocks": [block for block in code if block]})
-        except Exception:
-            pass
-    return {**(replies[-1] if replies else {"text": "", "code_blocks": []}), "reply_count": len(replies)}
+            found += 1
+            if found > REPLY_ARTICLE_LIMIT:
+                raise ReplyReadLimit("当前显示的消息中尚未找到最后一条 Claude 回复，请在 Ubuntu 打开最新对话后重试。")
+            if not direct_row and not assistant_article(node):
+                continue
+            # Code can expose native message rows directly, with a separate empty
+            # footer row after the actual reply. That footer is not a new message.
+            if direct_row and not direct_reply_payload(node):
+                continue
+            body, code = latest_reply_content(node)
+            return {**empty, "text": body, "code_blocks": code, "reply_count": 1,
+                    "read_status": "ready" if body else "empty",
+                    "read_reason": "" if body else "最后一条 Claude 回复暂时没有正文，请等待输出。"}
+        return {**empty, "read_reason": "当前会话还没有 Claude 回复。"}
+    except ReplyReadLimit as exc:
+        return {**empty, "read_status": "unavailable", "read_reason": str(exc)}
+    except Exception:
+        return {**empty, "read_status": "unavailable", "read_reason": "最后一条回复读取未完成，请稍后刷新。"}
 
 
 def reply_in_progress(page):
-    for node in walk(page):
-        try:
-            role = node.getRoleName()
+    """Read only controls/announcements outside the history feed, with a fixed budget."""
+    try:
+        for node, role, attrs in reply_metadata_nodes(page, reverse=True, prune_feeds=True):
             name = node.name if role == "push button" else None
             if role == "push button" and name in STOP_BUTTONS:
                 return True
-            if node_attributes(node).get("container-live") and (
-                    name if name is not None else node.name) == "Claude is responding":
+            if attrs.get("container-live") and (name if name is not None else node.name) == "Claude is responding":
                 return True
-        except Exception:
-            pass
+    except Exception:
+        pass
     return False
 
 
@@ -1632,9 +1767,14 @@ def dispatch(request):
         is_code = code_page(attrs)
         if is_code:
             page = code_panel(page)
-        result = {"context": context, "route": urlsplit(attrs["URI"]).path,
+        route = urlsplit(attrs["URI"]).path
+        reply = latest_reply(page)
+        if reply.get("read_status") == "unavailable" and (CODE_LOCAL_SESSION.fullmatch(route)
+                or re.fullmatch(r"/chat/[0-9a-f-]{36}/?", route, re.IGNORECASE)):
+            raise DesktopError(reply.get("read_reason") or "当前会话的最后一条回复尚未载入，请稍后刷新。")
+        result = {"context": context, "route": route,
                   "title": attrs.get("Title", "Claude"), "mode": "Code" if is_code else "Chat",
-                  "generating": reply_in_progress(page), **latest_reply(page)}
+                  "generating": reply_in_progress(page), **reply}
         confirm_page_context(context)
         return result
     raise DesktopError("不支持的客户端操作。")

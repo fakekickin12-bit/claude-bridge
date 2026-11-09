@@ -55,7 +55,7 @@ user = Node("article", children=[Node("heading", "You said: private prompt", ["c
 feed = Node("panel", "Chat messages", ["xml-roles:feed"], [user, old, latest])
 page = Node("document web", children=[Node("static", "Navigation"), feed, Node("static", "Claude is AI and can make mistakes. Opus 5.5")])
 clean = d.latest_reply(page)
-assert clean["reply_count"] == 2 and clean["text"].startswith("Hello world")
+assert clean["reply_count"] == 1 and clean["scope"] == "latest" and clean["text"].startswith("Hello world")
 assert 'print("ok")\n# second line' in clean["text"]
 assert clean["code_blocks"] == ['print("ok")\n# second line']
 assert not d.reply_in_progress(page)
@@ -98,7 +98,7 @@ with patch.object(d, "showing", side_effect=lambda node: node.visible):
     with patch.object(d, "document", return_value=(code_document, code_attrs)), patch.object(d, "app", return_value=application):
         captured = d.dispatch({"action": "capture"})
     assert captured["mode"] == "Code"
-    assert captured["reply_count"] == 2
+    assert captured["reply_count"] == 1 and captured["scope"] == "latest"
     assert captured["text"].startswith("Latest Code reply")
     assert captured["code_blocks"] == ["git status\ngit diff"]
     assert all(value not in captured["text"] for value in ["Private user prompt", "Earlier reply", "Not now", "Hello world"])
@@ -117,7 +117,7 @@ with patch.object(d, "showing", side_effect=lambda node: node.visible):
                 assert message in str(error)
 
 with tempfile.TemporaryDirectory(prefix="bridge-new-code-check-") as directory:
-    workspace = Path(directory) / "project-two"
+    workspace = Path(directory) / "storyboard"
     workspace.mkdir()
     other_workspace = Path(directory) / "other-project"
     other_workspace.mkdir()

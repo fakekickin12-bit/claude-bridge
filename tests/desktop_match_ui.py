@@ -43,7 +43,7 @@ def main():
                                 "reason": "正在读取当前会话"}}
                 assert action == "capture", "Matching must not navigate, check readiness, submit, or start a task"
                 if kwargs.get("context"):
-                    assert kwargs == {"context": current, "timeout": 90}
+                    assert kwargs == {"context": current, "timeout": 60}
                     return {"context": "c" * 64 if state["wrong_capture"] else current,
                             "mode": "Code", "text": "Latest reply of the current running task", "generating": True}
                 return {"context": state["external_context"], "mode": "Code", "title": state["external_title"],
@@ -111,12 +111,13 @@ def main():
             state["wrong_capture"] = True
             window.ubuntu_actions["match"].trigger()
             pool.drain()
-            assert not window.reply_original and window.pending_reply_context == current
+            assert not window.reply_original and not window.pending_reply_context
             assert "已忽略" in window.statusBar().currentMessage()
             state["wrong_capture"] = False
+            state.update(external_context=current, external_title="Current running task")
             window.refresh(quiet=True)
             pool.drain()
-            assert window.reply_original == "Latest reply of the current running task"
+            assert window.reply_original == "Latest external reply"
 
             # A later accepted refresh follows an external native switch without keeping the old project label.
             state.update(external_context="d" * 64, external_title="Another native task")

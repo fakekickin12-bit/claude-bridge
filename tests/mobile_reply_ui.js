@@ -333,6 +333,29 @@ async function executionTimeRevisionCanSatisfyTheNewSettings() {
   assert.equal(service.posts.length, 1, "Do not repeat a translation that already used the current settings");
 }
 
+async function latestReadStatesAreExplicitWithoutPaidCalls() {
+  class ReadService extends MockService {
+    constructor(reply) { super(); this.readReply = reply; }
+    state() { return {...super.state(), reply: this.readReply}; }
+  }
+  const context = "a".repeat(64);
+  const empty = new ReadService({text: "", source_hash: "", mode: "Code", context, generating: false,
+    updated_at: 1, loading: false, read_status: "empty", read_reason: "当前会话尚无 Claude 回复。"});
+  const page = browser(empty, new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true})]]));
+  await settle(() => page.elements.get("reply-status").textContent === "当前会话尚无 Claude 回复。", "Explicit empty latest reply");
+  assert.equal(page.elements.get("reply-empty").textContent, "当前会话尚无 Claude 回复。");
+  assert.equal(empty.posts.length, 0);
+
+  const failure = new ReadService({text: "", source_hash: "", mode: "Code", context, generating: false,
+    updated_at: 0, loading: false, read_status: "error", error: "最新回复读取超时，请刷新重试。"});
+  const storage = new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true,
+    replyNavigation: {id: "f".repeat(32), context, action: "match_current", show_reply: true, requires_fresh: true}})]]);
+  const failed = browser(failure, storage);
+  await settle(() => failed.elements.get("reply-status").textContent === "最新回复读取超时，请刷新重试。", "Matched task read failure is not endless loading");
+  assert.equal(failed.elements.get("reply-empty").textContent, "最新回复读取超时，请刷新重试。");
+  assert.equal(failure.posts.length, 0);
+}
+
 (async () => {
   await slowPostDoesNotStopPolling();
   await immediateCachedResultRenders();
@@ -340,7 +363,8 @@ async function executionTimeRevisionCanSatisfyTheNewSettings() {
   await changedEffortInvalidatesSameProfileReplyCache();
   await lateReplyRetainsItsActualSettingsRevision();
   await executionTimeRevisionCanSatisfyTheNewSettings();
-  console.log("Mobile reply UI passed: delayed polling, cached/reloaded results, stable profile ID, effort revisions, late-result correlation, no instruction resubmission");
+  await latestReadStatesAreExplicitWithoutPaidCalls();
+  console.log("Mobile reply UI passed: latest empty/error states, delayed polling, cached/reloaded results, stable profile ID, effort revisions, late-result correlation, no instruction resubmission");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

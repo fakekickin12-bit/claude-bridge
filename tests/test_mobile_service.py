@@ -25,6 +25,11 @@ PASSWORD = "synthetic-login-password"
 COOKIE = "__Host-bridge-device"
 
 
+@pytest.fixture(autouse=True)
+def synthetic_mobile_origin(monkeypatch):
+    monkeypatch.setenv("CLAUDE_BRIDGE_ORIGIN", ORIGIN)
+
+
 class FakeRemote:
     def __init__(self):
         self.context = CONTEXT
@@ -120,7 +125,6 @@ class FakeTranslator:
 
 @pytest.fixture
 def backend(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLAUDE_BRIDGE_ORIGIN", ORIGIN)
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     config = {"schema_version": 2, "provider": PROFILE,
               "profiles": {PROFILE: {"label": "Synthetic connection", "model": "synthetic-model", "kind": "api",
@@ -488,8 +492,107 @@ def test_confirmed_navigation_never_displays_wrong_context_reply(backend, monkey
     payload = request("open_project", profile="", expected_context=CONTEXT, catalog_id="b" * 64, project_id="c" * 64)
     result = run(backend, payload)
     assert result["state"] == "submitted" and result["result"]["reply_loading"] is True
-    assert backend.service.reply["text"] == "" and backend.service.reply["loading"] is True
+    assert backend.service.reply["text"] == "" and backend.service.reply["loading"] is False
+    assert backend.service.reply["read_status"] == "error" and backend.service.reply["error"]
     assert backend.service.target["context"] == "e" * 64
+
+
+def test_latest_reply_is_visible_before_readiness_probe_finishes(backend, monkeypatch):
+    original = backend.remote.action
+    observed = []
+
+    def inspect(action, **kwargs):
+        if action == "probe":
+            observed.append(dict(backend.service.reply))
+            assert backend.service.target["ready"] is False
+        return original(action, **kwargs)
+
+    monkeypatch.setattr(backend.remote, "action", inspect)
+    backend.service.capture()
+    assert [name for name, _ in backend.remote.calls] == ["capture", "probe"]
+    assert observed[0]["text"] == "Original reply" and observed[0]["context"] == CONTEXT
+    assert observed[0]["loading"] is False and observed[0]["scope"] == "latest"
+    assert not backend.translator.translations and not backend.translator.reply_translations
+
+
+def test_lightweight_poll_reuses_readiness_for_same_context(backend, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(mobile.time, "monotonic", lambda: clock[0])
+    backend.service.capture()
+    clock[0] += 5
+    backend.remote.reply["text"] = "Newest reply only"
+    backend.service.capture()
+    assert backend.remote.count("capture") == 2 and backend.remote.count("probe") == 1
+    assert backend.service.reply["text"] == "Newest reply only"
+    clock[0] += 30
+    backend.service.capture()
+    assert backend.remote.count("probe") == 2
+
+
+def test_probe_timeout_does_not_hide_latest_reply_or_repeat_each_poll(backend, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(mobile.time, "monotonic", lambda: clock[0])
+    original = backend.remote.action
+    probes = []
+
+    def fail_probe(action, **kwargs):
+        if action == "probe":
+            probes.append(kwargs)
+            clock[0] += 30
+            raise core.BridgeError("Readiness timeout")
+        return original(action, **kwargs)
+
+    monkeypatch.setattr(backend.remote, "action", fail_probe)
+    backend.service.capture()
+    assert backend.service.reply["text"] == "Original reply" and not backend.service.reply["error"]
+    assert backend.service.target["ready"] is False and "最新回复已读取" in backend.service.target["reason"]
+    clock[0] += 5
+    backend.service.capture()
+    assert len(probes) == 1 and backend.remote.count("capture") == 2
+
+
+def test_failed_latest_read_has_finite_error_instead_of_permanent_loading(backend, monkeypatch):
+    backend.service.reply = {"text": "Old task", "context": CONTEXT, "loading": True}
+    backend.service.target = {"context": CONTEXT, "ready": True}
+
+    def fail(action, **kwargs):
+        assert action == "capture"
+        raise core.BridgeError("Latest reply unavailable")
+
+    monkeypatch.setattr(backend.remote, "action", fail)
+    backend.service.capture()
+    assert backend.service.reply["text"] == "" and backend.service.reply["loading"] is False
+    assert backend.service.reply["error"] == "Latest reply unavailable"
+    assert backend.service.reply["read_status"] == "error"
+    assert backend.service.target["ready"] is False and not backend.service.remote_lock.locked()
+
+
+def test_newer_probe_page_never_gets_previous_page_reply(backend, monkeypatch):
+    original = backend.remote.action
+
+    def changed_page(action, **kwargs):
+        if action == "probe":
+            backend.remote.context = "e" * 64
+        return original(action, **kwargs)
+
+    monkeypatch.setattr(backend.remote, "action", changed_page)
+    backend.service.capture()
+    assert backend.service.target["context"] == backend.service.reply["context"] == "e" * 64
+    assert backend.service.reply["text"] == "" and backend.service.reply["loading"] is True
+    assert backend.service.capture_wake.is_set()
+    backend.remote.reply["text"] = "New page's reply"
+    backend.service.capture()
+    assert backend.service.reply["text"] == "New page's reply" and not backend.service.reply["loading"]
+
+
+def test_finished_generation_rechecks_readiness_without_guessing(backend):
+    backend.remote.reply["generating"] = True
+    backend.service.capture()
+    backend.service.capture()
+    assert backend.service.target["ready"] is False and backend.remote.count("probe") == 1
+    backend.remote.reply["generating"] = False
+    backend.service.capture()
+    assert backend.remote.count("probe") == 2 and backend.service.target["ready"] is True
 
 
 def test_old_job_payload_without_new_session_signature_keeps_original_idempotency(backend):
@@ -930,8 +1033,7 @@ def test_single_service_instance_lock_rejects_duplicate_and_releases(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Exercises real Windows owner ACLs")
-def test_pairing_note_keeps_owner_read_write_and_allows_new_pair_code(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLAUDE_BRIDGE_ORIGIN", ORIGIN)
+def test_pairing_note_keeps_owner_read_write_and_allows_new_pair_code(tmp_path):
     note = mobile.issue_pairing_code(tmp_path)
     assert note == tmp_path / "mobile" / "设备配对信息.txt" and note.is_file()
     original = note.read_bytes()

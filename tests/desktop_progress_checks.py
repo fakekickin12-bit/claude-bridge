@@ -1,4 +1,4 @@
-"""Generating predicate retains exact behavior without reading ordinary body names."""
+"""Generating predicate reads controls and live announcements outside history bodies."""
 from pathlib import Path
 import sys
 
@@ -28,8 +28,8 @@ for stop in d.STOP_BUTTONS:
     assert d.reply_in_progress(Node("section", children=[Node("push button", stop)]))
 for role in ("section", "static", "article", "panel", "entry", "push button"):
     announcement = Node(role, "Claude is responding", ["container-live:polite"])
-    assert d.reply_in_progress(Node("article", children=[announcement]))
+    assert d.reply_in_progress(Node("section", children=[announcement]))
 assert not d.reply_in_progress(Node("section", children=[Node("static", "Stop response"),
                                                         Node("static", "Claude is responding")]))
 assert not d.reply_in_progress(Node("static", "Something else", ["container-live:polite"]))
-print("Generating predicate checks passed: body-name canary, every Stop label, announcements of any role inside articles, and non-live/text false positives")
+print("Generating predicate checks passed: history-body canary, every Stop label, direct live announcements of any role, and non-live/text false positives")

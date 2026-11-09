@@ -60,6 +60,8 @@ QMenu { background: #FAFCFF; border: 1px solid #BCCBDE; }
 QMenu::item { padding: 8px 24px; }
 """
 
+REPLY_READ_TIMEOUT = 60
+
 
 def label(text, name=None, wrap=False):
     widget = QLabel(text)
@@ -781,6 +783,8 @@ class Window(QMainWindow):
         self.reply_original = ""
         self.reply_code_blocks = []
         self.reply_generating = False
+        self.reply_read_status = ""
+        self.reply_read_error = ""
         self.reply_job = None
         self.capture_job = None
         self.capture_epoch = 0
@@ -1320,6 +1324,8 @@ class Window(QMainWindow):
         self.target_action.setText(menu_text(f"当前目标：{self.config['ssh']['host']} · {title}"))
         self.capture_epoch += 1
         self.pending_reply_context = context
+        self.reply_read_status = "正在读取最后一条回复…"
+        self.reply_read_error = ""
         if result.get("switched") or self.reply_context != context:
             self.last_fingerprint = None
             self.reply_original = ""
@@ -1344,6 +1350,8 @@ class Window(QMainWindow):
         self.reply_code_blocks = []
         self.reply_generating = False
         self.reply_failures.clear()
+        self.reply_read_status = "正在匹配当前对话…"
+        self.reply_read_error = ""
         self.render_reply()
         self.terminal.setPlaceholderText("正在匹配 Ubuntu 当前对话并读取最新回复…")
 
@@ -1359,7 +1367,10 @@ class Window(QMainWindow):
 
         def failed(message):
             self.pending_reply_context = ""
+            self.reply_read_status = "匹配未完成，请重试"
+            self.reply_read_error = message
             self.terminal.setPlaceholderText("未能匹配当前对话。请在 Ubuntu 打开目标 Code 会话后重试。")
+            self.render_reply()
 
         self.job("正在匹配当前对话…", lambda: SSH(target).action("match_current", timeout=90), done, failed)
 
@@ -1616,10 +1627,16 @@ class Window(QMainWindow):
         try:
             client = SSH(target)
         except BridgeError as exc:
+            self.reply_read_failed(str(exc), expected_context)
             self.statusBar().showMessage(str(exc))
             return
-        job = Job(lambda: client.action("capture", context=expected_context, timeout=90) if expected_context
-                  else client.action("capture"))
+        self.reply_read_status = "正在读取最后一条回复…"
+        self.reply_read_error = ""
+        if not self.reply_original:
+            self.terminal.setPlaceholderText(self.reply_read_status)
+        self.render_reply()
+        job = Job(lambda: client.action("capture", context=expected_context, timeout=REPLY_READ_TIMEOUT) if expected_context
+                  else client.action("capture", timeout=REPLY_READ_TIMEOUT))
         self.capture_job = job
         def done(result):
             self.capture_job = None
@@ -1628,7 +1645,9 @@ class Window(QMainWindow):
             if epoch != self.capture_epoch or target != self.config["ssh"] or self.busy:
                 self.capture_pending = True
             elif expected_context and (expected_context != self.pending_reply_context or result.get("context") != expected_context):
-                self.statusBar().showMessage("回复不属于刚选中的会话，已忽略。请重新读取或选择项目。")
+                message = "回复不属于刚选中的会话，已忽略。下次刷新将读取 Ubuntu 当前对话。"
+                self.reply_read_failed(message, expected_context)
+                self.statusBar().showMessage(message)
             else:
                 if expected_context:
                     self.pending_reply_context = ""
@@ -1649,8 +1668,7 @@ class Window(QMainWindow):
                 self.capture_pending = True
                 self.flush_pending_capture()
                 return
-            if quiet:
-                self.auto_refresh.setChecked(False)
+            self.reply_read_failed(error, expected_context)
             self.statusBar().showMessage(error)
             if not quiet:
                 QMessageBox.warning(self, "读取回复未完成", error)
@@ -1658,6 +1676,16 @@ class Window(QMainWindow):
         job.signals.done.connect(done)
         job.signals.failed.connect(failed)
         QThreadPool.globalInstance().start(job)
+
+    def reply_read_failed(self, message, expected_context=""):
+        if expected_context and self.pending_reply_context == expected_context:
+            # This is only a one-read view binding. A later read may safely follow
+            # the native current page; it never submits or changes a task.
+            self.pending_reply_context = ""
+        self.reply_read_status = "读取未完成，保留上次回复" if self.reply_original else "读取未完成，请重试"
+        self.reply_read_error = message
+        self.terminal.setPlaceholderText("最后一条回复读取未完成：" + message)
+        self.render_reply()
 
     def flush_pending_capture(self):
         if self.capture_pending and not self.busy and not self.capture_job and not self.closing:
@@ -1690,15 +1718,22 @@ class Window(QMainWindow):
             else:
                 status = "正在翻译…" if self.reply_job else "等待翻译…"
             self.reply_translation_status.setToolTip(self.reply_failures.get(key, ""))
-        self.reply_translation_status.setText(status)
+        self.reply_translation_status.setText(" · ".join(value for value in (self.reply_read_status, status) if value))
+        if self.reply_read_error:
+            self.reply_translation_status.setToolTip(self.reply_read_error)
+        elif not status:
+            self.reply_translation_status.setToolTip("")
         self.set_reply_text(value)
 
     def accept_reply(self, result):
-        self.terminal.setPlaceholderText("当前对话的最新回复会显示在这里。拖动上方分隔条调整阅读区高度。")
         self.reply_heading.setText("Claude Code 回复" if result.get("mode") == "Code" else "Claude 回复")
         self.reply_original = result.get("text", "").rstrip("\r\n")
         self.reply_code_blocks = [x for x in result.get("code_blocks", []) if isinstance(x, str)]
         self.reply_generating = bool(result.get("generating", False))
+        self.reply_read_error = ""
+        self.reply_read_status = "" if self.reply_original else result.get("read_reason") or (
+            "Claude 正在生成最后一条回复，暂未返回正文…" if self.reply_generating else "当前会话暂未读到 Claude 回复。")
+        self.terminal.setPlaceholderText(self.reply_read_status or "只显示当前会话最后一条 Claude 回复。拖动上方分隔条调整阅读区高度。")
         self.render_reply()
         self.maybe_translate_reply()
 

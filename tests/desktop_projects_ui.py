@@ -68,7 +68,7 @@ def main():
                     return catalogue()
                 if action == "capture":
                     if kwargs.get("context"):
-                        assert kwargs["context"] == state["context"] and kwargs["timeout"] == 90
+                        assert kwargs["context"] == state["context"] and kwargs["timeout"] == 60
                     return {"mode": "Code", "text": "Reply for " + state["session"], "generating": False,
                             "context": "0" * 64 if state["capture_wrong"] else state["context"]}
                 assert action in {"open_project", "switch_project"}, "Navigation must not send a message"
@@ -177,7 +177,7 @@ def main():
             assert window.busy
             pool.drain()
             assert not picker.active_dialog and not window.reply_original
-            assert window.pending_reply_context == "e" * 64
+            assert not window.pending_reply_context
             assert "已忽略" in window.statusBar().currentMessage()
             assert (window.source.toPlainText(), window.english.toPlainText(), window.attachments) == original
             state["capture_wrong"] = False
