@@ -92,6 +92,57 @@ with patch.object(d, "app", return_value=application), patch.object(d, "document
     assert not d.running_submission_confirmed(initial, {**current, "draft": value}, expected_hash, baseline)
     rejected(lambda: d.running_submission_confirmed(initial, {**current, "context": "b" * 64}, expected_hash, baseline))
 
+# A long-running response can virtualize the original human row. Its retained
+# native tail row is a usable boundary, but only a later human row in the same
+# ordered feed can prove receipt. No older assistant/user body may be read.
+def assistant_row():
+    return Node("article", children=[Node("heading", "Claude responded:", ["class:sr-only"]),
+        Node(attrs=["class:group/message-row"], children=[Node("paragraph", children=[
+            Node("static", "Long-running private response", forbid_name=True)])])])
+
+
+tail = assistant_row()
+tail_container = Node(children=[tail])
+tail_feed = Node("panel", "Chat messages", ["xml-roles:feed"], [tail_container])
+tail_page = Node("document web", children=[tail_feed])
+tail_baseline = d.running_user_snapshot(tail_page)
+assert tail_baseline == {"feed_id": tail_feed.path, "anchor_kind": "tail_row", "tail_id": tail.path}
+rejected(lambda: d.running_user_snapshot(tail_page, read_text=True))
+
+
+def unconfirmed(call):
+    try:
+        assert not call(), "An unproved running insertion was acknowledged"
+    except d.DesktopError:
+        pass
+
+
+later = human(value)
+tail_container.children.append(later)
+assert d.running_user_snapshot(tail_page, read_text=True, after_tail=tail.path)["text"] == value
+with patch.object(d, "app", return_value=application), patch.object(d, "document", return_value=(tail_page, {})), \
+     patch.object(d, "page_context", return_value=context), patch.object(d, "code_panel", return_value=tail_page):
+    tail_proof = d.running_submission_confirmed(initial, current, expected_hash, tail_baseline)
+    assert tail_proof["kind"] == "new_user_message" and len(tail_proof["message_id_hash"]) == 64
+    assert not d.running_submission_confirmed(initial, current, d.normalized_message_hash("Different message"), tail_baseline)
+    # A prior identical prompt being mounted again is not the submitted copy.
+    prior_identical = human(value, True)
+    tail_container.children = [prior_identical, tail]
+    rejected(lambda: d.running_user_snapshot(tail_page, read_text=True, after_tail=tail.path))
+    unconfirmed(lambda: d.running_submission_confirmed(initial, current, expected_hash, tail_baseline))
+    # A newly allocated look-alike boundary cannot substitute for its native ID.
+    replacement_tail = assistant_row()
+    tail_container.children = [replacement_tail, later]
+    rejected(lambda: d.running_user_snapshot(tail_page, read_text=True, after_tail=tail.path))
+    unconfirmed(lambda: d.running_submission_confirmed(initial, current, expected_hash, tail_baseline))
+    tail_container.children = [later]
+    unconfirmed(lambda: d.running_submission_confirmed(initial, current, expected_hash, tail_baseline))
+    tail_container.children = [tail, later]
+    original_feed_path = tail_feed.path
+    tail_feed.path = "/org/a11y/atspi/accessible/different_feed"
+    unconfirmed(lambda: d.running_submission_confirmed(initial, current, expected_hash, tail_baseline))
+    tail_feed.path = original_feed_path
+
 # Moving focus to another control during the slow status scan must prevent the
 # Return fallback even while the same Claude window remains active.
 focus = {"present": True}
@@ -245,6 +296,31 @@ with tempfile.TemporaryDirectory(prefix="bridge-running-send-") as directory:
         r.atomic(ledger, pending)
         with patch.object(d, "status", side_effect=AssertionError("Mismatched receipt touched UI")):
             assert not d.delivery_status({**lookup, "fingerprint": "0" * 64})["found"]
+        # Tail-boundary receipts remain read-only and tied to the same ledger.
+        # They may be reconciled only after the retained ordered anchor exists.
+        pending_tail = {**pending, "running_submission": {
+            "schema": 2, "process_id": pid, **tail_baseline, "expected_text_sha256": expected_hash}}
+        r.atomic(ledger, pending_tail)
+        with patch.object(d, "status", return_value=current) as status, \
+             patch.object(d, "running_submission_confirmed", return_value=False) as verify, \
+             patch.object(d, "send", side_effect=AssertionError("Tail receipt replayed send")):
+            assert not d.delivery_status(lookup)["completed"]
+            assert status.call_count == 1
+            verify.assert_called_once_with({"context": context, "mode": "Code", "process_id": pid},
+                                          current, expected_hash, pending_tail["running_submission"])
+            with patch.object(d, "running_submission_confirmed", return_value=tail_proof):
+                assert d.delivery_status(lookup)["completed"]
+                assert json.loads(ledger.read_text())["submission_evidence"] == tail_proof
+        for bad_anchor in ({"tail_id": "/tmp/not-a-native-id"}, {"tail_id": ""}, {"tail_id": None},
+                           {"anchor_kind": "unknown"}, {"feed_id": "/tmp/not-a-native-feed"}, {"schema": True}):
+            r.atomic(ledger, {**pending_tail, "running_submission": {**pending_tail["running_submission"], **bad_anchor}})
+            with patch.object(d, "status", side_effect=AssertionError("Invalid tail receipt touched UI")):
+                assert not d.delivery_status(lookup)["completed"]
+        # Existing schema-1 human markers still support a read-only lookup.
+        r.atomic(ledger, pending)
+        with patch.object(d, "status", return_value=current) as status, \
+             patch.object(d, "running_submission_confirmed", return_value=False):
+            assert not d.delivery_status(lookup)["completed"] and status.call_count == 1
         # Unknown requests cannot execute another submit action under the same ID.
         with patch.object(d, "check_ready", side_effect=AssertionError("Unknown send replayed")):
             rejected(lambda: d.send(request))

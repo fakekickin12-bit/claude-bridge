@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -1807,14 +1807,16 @@ def code_submission_confirmed(initial, current, value):
     return True
 
 
-def running_user_snapshot(page, *, read_text=False):
-    """Read only the latest native human message, never the older body history."""
+def running_user_snapshot(page, *, read_text=False, after_tail=None):
+    """Read one human body; a mounted tail can witness a virtualized old user."""
     feeds = [node for node, role, attrs in reply_metadata_nodes(page, reverse=True, prune_feeds=True)
              if message_feed(node, role, attrs)]
     if len(feeds) != 1:
         raise DesktopError("追加消息的当前消息列表尚未就绪，请到 Ubuntu 查看；不会自动重发。")
-    feed, selected = feeds[0], None
+    feed, selected, tail = feeds[0], None, None
     try:
+        if after_tail is not None or not read_text:
+            raise LookupError("A submission boundary requires one ordered metadata scan")
         from gi.repository import Atspi
         atspi, collection = initialize(), feed.queryCollection()
         rule = collection.createMatchRule(
@@ -1827,14 +1829,33 @@ def running_user_snapshot(page, *, read_text=False):
                 break
     except Exception:
         pass
-    if selected is None:
+    if selected is None or after_tail is not None:
+        found_tail = False
         for node, role, attrs in reply_metadata_nodes(feed, reverse=True, limit=768, turn_boundaries=True):
             classes = attrs.get("class", "").split()
-            if ("group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes
-                    or role == "article" and turn_article_speaker(node)[0] == "user"):
-                selected = node
-                break
+            speaker = turn_article_speaker(node)[0] if role == "article" else None
+            is_user = ("group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes
+                       or speaker == "user")
+            is_assistant = "group/message-row" in classes or speaker == "assistant"
+            if after_tail is not None:
+                if is_assistant and accessible_key(node) == after_tail:
+                    found_tail = True
+                    break
+                if selected is None and is_user:
+                    selected = node
+            else:
+                if tail is None and is_assistant:
+                    tail = node
+                    if not read_text:
+                        return {"feed_id": accessible_key(feed), "anchor_kind": "tail_row", "tail_id": accessible_key(tail)}
+                if is_user:
+                    selected = node
+                    break
+        if after_tail is not None and (not found_tail or selected is None):
+            raise DesktopError("追加消息尚未出现在原消息边界之后，请到 Ubuntu 查看；不会自动重发。")
     if selected is None:
+        if not read_text and tail is not None:
+            return {"feed_id": accessible_key(feed), "anchor_kind": "tail_row", "tail_id": accessible_key(tail)}
         raise DesktopError("尚未确认追加消息的原始用户消息标记，请到 Ubuntu 查看；不会自动重发。")
     result = {"feed_id": accessible_key(feed), "message_id": accessible_key(selected)}
     if not read_text:
@@ -1904,8 +1925,9 @@ def running_submission_confirmed(initial, current, expected_hash, baseline):
     page, attrs = document(application)
     if page_context(application, page, attrs) != initial["context"]:
         raise DesktopError("核对追加消息时客户端已切换会话，结果未确认。")
-    after = running_user_snapshot(code_panel(page), read_text=True)
-    if (after["feed_id"] != baseline["feed_id"] or after["message_id"] == baseline["message_id"]
+    after = (running_user_snapshot(code_panel(page), read_text=True, after_tail=baseline["tail_id"])
+             if baseline.get("anchor_kind") == "tail_row" else running_user_snapshot(code_panel(page), read_text=True))
+    if (after["feed_id"] != baseline["feed_id"] or after["message_id"] == baseline.get("message_id")
             or normalized_message_hash(after["text"]) != expected_hash):
         return False
     return {"kind": "new_user_message", "message_id_hash": hashlib.sha256(after["message_id"].encode()).hexdigest()}
@@ -1953,10 +1975,12 @@ def reconcile_running_delivery(ledger, record):
     pending = record.get("running_submission")
     valid_path = lambda value: isinstance(value, str) and bool(re.fullmatch(r"/org/a11y/atspi/accessible/[A-Za-z0-9_/-]+", value))
     if (record.get("state") != "submitting" or record.get("auto_enter") is not True
-            or not isinstance(pending, dict) or type(pending.get("schema")) is not int or pending["schema"] != 1
+            or not isinstance(pending, dict) or type(pending.get("schema")) is not int or pending["schema"] not in {1, 2}
             or not isinstance(record.get("context"), str) or not re.fullmatch(r"[a-f0-9]{64}", record["context"])
             or not isinstance(pending.get("process_id"), int) or isinstance(pending["process_id"], bool) or pending["process_id"] <= 0
-            or not all(valid_path(pending.get(key)) for key in ("feed_id", "message_id"))
+            or not valid_path(pending.get("feed_id"))
+            or (pending["schema"] == 1 and (not valid_path(pending.get("message_id")) or "anchor_kind" in pending or "tail_id" in pending))
+            or (pending["schema"] == 2 and (pending.get("anchor_kind") != "tail_row" or not valid_path(pending.get("tail_id")) or "message_id" in pending))
             or not isinstance(pending.get("expected_text_sha256"), str)
             or not re.fullmatch(r"[a-f0-9]{64}", pending["expected_text_sha256"])):
         return record
@@ -2283,7 +2307,7 @@ def prepare_message_submission(initial, current, record, value, paths):
         if page_context(application, current_page, current_attrs) != initial["context"]:
             raise DesktopError("追加消息目标已经变化，已保留草稿。")
         baseline = running_user_snapshot(code_panel(current_page))
-        record["running_submission"] = {"schema": 1, "process_id": initial["process_id"],
+        record["running_submission"] = {"schema": 2 if baseline.get("anchor_kind") == "tail_row" else 1, "process_id": initial["process_id"],
             **baseline, "expected_text_sha256": normalized_message_hash(value)}
         record["delivery_mode"] = "running_insert"
         if send_button is None:
