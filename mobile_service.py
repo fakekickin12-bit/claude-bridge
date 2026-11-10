@@ -41,6 +41,51 @@ DESKTOP_KEYS = {"Return", "Enter", "Tab", "BackSpace", "Delete", "Escape", "Left
                 "Control_L+Shift_L+z"}
 
 
+def safe_question(value):
+    """Expose only the bounded, read-only fields of a native choice card."""
+    if not isinstance(value, dict) or not isinstance(value.get("prompt"), str):
+        return None
+    prompt = value["prompt"].strip()[:8000]
+    raw_options = value.get("options")
+    if not prompt or not isinstance(raw_options, list):
+        return None
+    options = []
+    for option in raw_options[:20]:
+        if not isinstance(option, dict) or not isinstance(option.get("label"), str):
+            continue
+        label = option["label"].strip()[:2000]
+        if not label:
+            continue
+        description = option.get("description", "")
+        selected = option.get("selected")
+        options.append({"label": label, "description": description.strip()[:4000] if isinstance(description, str) else "",
+                        "selected": selected if isinstance(selected, bool) else None})
+    if not options:
+        return None
+    page, total = value.get("page"), value.get("total_pages")
+    if (not isinstance(page, int) or isinstance(page, bool) or not isinstance(total, int)
+            or isinstance(total, bool) or not 1 <= page <= total <= 50):
+        page = total = None
+    raw_actions = value.get("actions", [])
+    actions = [action.strip()[:80] for action in raw_actions[:8] if isinstance(action, str) and action.strip()] if isinstance(raw_actions, list) else []
+    return {"prompt": prompt, "page": page, "total_pages": total, "options": options,
+            "multiple": value.get("multiple") is True, "actions": actions,
+            "read_status": "unavailable" if value.get("read_status") == "unavailable" else "ready"}
+
+
+def question_text(question):
+    """A card-only capture still has a normal text source for translation."""
+    if not question:
+        return "Claude 正在等待你选择，请到 Ubuntu 查看并操作。"
+    position = f" · 问题 {question['page']}/{question['total_pages']}" if question["page"] else ""
+    parts = [f"[Claude 等待你选择{position}]", question["prompt"]]
+    for index, option in enumerate(question["options"], 1):
+        mark = "（当前勾选，尚未提交）" if option["selected"] is True else ""
+        parts.append(f"{index}. {option['label']}{mark}" + ("\n" + option["description"] if option["description"] else ""))
+    parts.append("这里只显示选项，请在 Ubuntu 客户端或远程桌面选择并提交。")
+    return "\n\n".join(parts)
+
+
 class RequestSizeLimit:
     """Bound streamed bodies before multipart parsing creates temporary files."""
 
@@ -650,6 +695,7 @@ class MobileBridge:
         result = {key: target.get(key) for key in (
             "ready", "mode", "title", "context", "workspace", "reason", "busy", "window_visible", "new_session",
             "project_title", "session_title")}
+        result["awaiting_input"] = target.get("awaiting_input") is True
         result["draft_chars"] = target.get("draft_chars", len(target.get("draft", "")))
         result["capabilities"] = {"native_attachments": (target.get("capabilities") or {}).get("native_attachments") is True}
         return result
@@ -704,6 +750,7 @@ class MobileBridge:
                 raise core.BridgeError("Ubuntu 连接设置已变化，正在重新读取。")
             with self.lock:
                 previous_generating = bool(self.reply.get("generating"))
+                previous_waiting = self.reply.get("awaiting_input") is True
                 if self.target.get("context") != context or self.target_probe_connection != connection_key:
                     self.target = self.safe_target({"context": context, "mode": reply.get("mode"),
                         "title": reply.get("title", "当前会话"), "ready": False,
@@ -715,10 +762,12 @@ class MobileBridge:
                     self.project_catalog = {"projects": [], "loading": False, "reason": ""}
                     self.projects_initialized = False
                 self.accept_capture(reply, context)
-                need_probe = (self.target_probe_context != context
+                awaiting_input = self.reply.get("awaiting_input") is True
+                need_probe = not awaiting_input and (self.target_probe_context != context
                               or self.target_probe_connection != connection_key
                               or time.monotonic() - self.last_target_probe >= 30
-                              or previous_generating and not reply.get("generating"))
+                              or previous_generating and not reply.get("generating")
+                              or previous_waiting)
             if not need_probe:
                 return
             self.last_target_probe = time.monotonic()
@@ -761,7 +810,7 @@ class MobileBridge:
 
     def capture_failed(self, message):
         with self.lock:
-            self.target = {**self.target, "ready": False, "reason": message}
+            self.target = {**self.target, "ready": False, "awaiting_input": False, "reason": message}
             self.reply = {"text": "", "source_hash": "", "mode": self.reply.get("mode", ""),
                           "context": self.target.get("context", ""), "loading": False, "generating": False,
                           "updated_at": 0, "error": message, "read_status": "error", "read_reason": message}
@@ -772,6 +821,10 @@ class MobileBridge:
         if not expected_context or reply.get("context") != expected_context:
             raise core.BridgeError("回复所属会话未确认，未显示其他项目的内容。")
         raw = reply.get("text", "").rstrip("\r\n")
+        awaiting_input = reply.get("awaiting_input") is True
+        question = safe_question(reply.get("question")) if awaiting_input else None
+        if awaiting_input and not raw.strip():
+            raw = question_text(question)
         scope = "current_turn" if reply.get("scope") == "current_turn" else "latest"
         count = reply.get("message_count")
         if (scope != "current_turn" or not isinstance(count, int) or isinstance(count, bool)
@@ -782,10 +835,18 @@ class MobileBridge:
         with self.lock:
             self.reply = {"text": raw, "source_hash": hashlib.sha256(raw.encode()).hexdigest() if raw else "",
                           "mode": reply.get("mode", ""), "context": expected_context, "loading": False,
-                          "generating": bool(reply.get("generating")), "updated_at": time.time(), "error": "",
-                          "read_status": reply.get("read_status") or ("ready" if raw else "empty"),
+                          "generating": bool(reply.get("generating")) and not awaiting_input,
+                          "awaiting_input": awaiting_input, "question": (question or {}) if awaiting_input else None,
+                          "updated_at": time.time(), "error": "",
+                          "read_status": "waiting_input" if awaiting_input else reply.get("read_status") or ("ready" if raw else "empty"),
                           "read_reason": reply.get("read_reason", ""), "scope": scope, "message_count": count, "turn_id": turn_id}
             self.code_blocks = [value for value in reply.get("code_blocks", []) if isinstance(value, str)]
+            if self.target.get("context") == expected_context:
+                if awaiting_input:
+                    self.target = {**self.target, "ready": False, "busy": False, "awaiting_input": True,
+                                   "reason": "Claude 正在等待你选择，请到 Ubuntu 查看并操作。"}
+                else:
+                    self.target = {**self.target, "awaiting_input": False}
 
     def translate_reply(self, payload):
         if payload.get("incremental"):

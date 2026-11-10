@@ -43,6 +43,7 @@ class Element {
     this.classList = {
       add: name => classes.add(name),
       remove: name => classes.delete(name),
+      contains: name => classes.has(name),
       toggle(name, active) {
         if (active) classes.add(name);
         else classes.delete(name);
@@ -128,7 +129,7 @@ class MockService {
       const payload = JSON.parse(options.body);
       assert.equal(payload.action, "translate_reply");
       assert.equal(payload.profile, profileId, "Use profile ID, not its display label");
-      assert.equal(payload.source_hash, sourceHash);
+      assert.equal(payload.source_hash, this.state().reply.source_hash);
       this.posts.push(copy(payload));
       const queued = {id: payload.id, action: payload.action, profile: payload.profile, state: "queued"};
       this.jobs.set(payload.id, queued);
@@ -152,7 +153,7 @@ class MockService {
   }
 }
 
-function browser(service, storage = new Map()) {
+function browser(service, storage = new Map(), options = {}) {
   const elements = new Map();
   for (const match of htmlSource.matchAll(/\bid="([^"]+)"/g)) elements.set(match[1], new Element(match[1]));
   const tabs = ["compose", "reply", "history"].map(tab => {
@@ -185,7 +186,7 @@ function browser(service, storage = new Map()) {
     },
     clearInterval: id => intervals.delete(id),
     localStorage: {getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value)},
-    document,
+    document, navigator: options.navigator || {},
     window: {location: {hash: "", pathname: "/", search: ""}, history: {replaceState() {}}, addEventListener() {}},
     fetch: (url, options) => service.fetch(url, options)
   };
@@ -351,9 +352,83 @@ async function latestReadStatesAreExplicitWithoutPaidCalls() {
   const storage = new Map([[storageKey, JSON.stringify({profile: profileId, replyTranslated: true,
     replyNavigation: {id: "f".repeat(32), context, action: "match_current", show_reply: true, requires_fresh: true}})]]);
   const failed = browser(failure, storage);
-  await settle(() => failed.elements.get("reply-status").textContent === "最新回复读取超时，请刷新重试。", "Matched task read failure is not endless loading");
-  assert.equal(failed.elements.get("reply-empty").textContent, "最新回复读取超时，请刷新重试。");
+  const failureNotice = "最新回复读取超时，请刷新重试。 请到 Ubuntu 查看当前任务。";
+  await settle(() => failed.elements.get("reply-status").textContent === failureNotice, "Matched task read failure is not endless loading");
+  assert.equal(failed.elements.get("reply-empty").textContent, failureNotice);
+  assert(failed.elements.get("reply-status").classList.contains("warning"));
   assert.equal(failure.posts.length, 0);
+}
+
+async function waitingChoiceStaysVisibleDuringTranslationAndClears() {
+  class QuestionService extends MockService {
+    constructor() { super("queued"); this.waiting = true; this.readError = ""; }
+    state() {
+      const state = super.state();
+      const text = this.waiting ? "Which narrator voice should be used?\n\n1. Man, 45-55\nWarm storyteller.\n\n2. Woman, 40-55" : originalReply;
+      return {...state, target: {...state.target, ready: !this.waiting, busy: false, awaiting_input: this.waiting},
+        reply: {...state.reply, text, source_hash: crypto.createHash("sha256").update(text).digest("hex"),
+          awaiting_input: this.waiting, question: this.waiting ? {prompt: "Which narrator?", page: 1, total_pages: 3} : null,
+          error: this.readError}};
+    }
+  }
+  const service = new QuestionService();
+  const page = browser(service);
+  await settle(() => page.elements.get("reply-status").textContent.includes("请到 Ubuntu"), "Choice card waiting banner");
+  assert.equal(page.elements.get("target-state").textContent, "等待你选择");
+  assert(page.elements.get("reply-status").classList.contains("warning"));
+  assert(page.elements.get("reply-text").textContent.includes("Warm storyteller."));
+  assert(!page.elements.get("reply-text").classList.contains("warning"), "Only the status is yellow");
+  assert.equal(service.posts.length, 0);
+  page.click("translate-reply-button");
+  await settle(() => service.posts.length === 1, "Choice card uses existing reply translation");
+  assert(page.elements.get("reply-status").textContent.includes("请到 Ubuntu"));
+  assert(page.elements.get("reply-status").textContent.includes("翻译"));
+  service.complete(service.posts[0]); page.poll(1000);
+  await settle(() => page.elements.get("reply-text").textContent === chineseReply, "Translated choice body");
+  assert(page.elements.get("reply-status").textContent.includes("请到 Ubuntu"), "Translation cannot erase the waiting banner");
+  page.click("translate-reply-button");
+  service.waiting = false; page.poll(5000);
+  await settle(() => page.elements.get("reply-text").textContent === originalReply, "Choice disappears on fresh capture");
+  assert(!page.elements.get("reply-status").textContent.includes("请到 Ubuntu"));
+  assert(!page.elements.get("reply-status").classList.contains("warning"));
+  service.readError = "本轮消息起点未载入，请到 Ubuntu 查看当前对话。"; page.poll(5000);
+  await settle(() => page.elements.get("reply-status").textContent === service.readError, "Native inspection warning");
+  assert(page.elements.get("reply-status").classList.contains("warning"));
+  service.readError = ""; page.poll(5000);
+  await settle(() => page.elements.get("reply-status").textContent === "", "Warning resets on recovered capture");
+  assert(!page.elements.get("reply-status").classList.contains("warning"));
+  assert(service.posts.every(post => post.action === "translate_reply"));
+  const css = fs.readFileSync(path.join(web, "app.css"), "utf8");
+  assert.match(css, /\.reply-status\.warning\s*\{[^}]*color:\s*#805600/i);
+}
+
+async function englishCopyUsesWholeEditedDraftWithoutAnyJob() {
+  const writes = [];
+  const service = new MockService();
+  const page = browser(service, new Map(), {navigator: {clipboard: {writeText: async text => writes.push(text)}}});
+  await settle(() => page.elements.get("profile-select").value === profileId, "Copy initial state");
+  const text = "  Manually edited full draft.\nSecond line.  ";
+  const english = page.elements.get("english");
+  english.value = text; english.selectionStart = 2; english.selectionEnd = 10; english.dispatch("input");
+  assert.equal(page.elements.get("english-copy-button").disabled, false);
+  page.click("english-copy-button");
+  await settle(() => page.elements.get("notice").textContent === "已复制英文稿。", "Copy success");
+  assert.deepEqual(writes, [text]);
+  assert.equal(english.value, text);
+  assert.equal(service.posts.length, 0);
+  english.value = " \n "; english.dispatch("input");
+  assert.equal(page.elements.get("english-copy-button").disabled, true);
+  page.click("english-copy-button");
+  assert.equal(writes.length, 1, "Empty drafts never replace the clipboard");
+  for (const navigator of [{}, {clipboard: {writeText: async () => { throw new Error("Permission denied"); }}}]) {
+    const failed = browser(new MockService(), new Map(), {navigator});
+    await settle(() => failed.elements.get("profile-select").value === profileId, "Copy failure initial state");
+    failed.elements.get("english").value = text; failed.elements.get("english").dispatch("input");
+    failed.click("english-copy-button");
+    await settle(() => failed.elements.get("notice").textContent.includes("手动全选后复制"), "Copy failure advice");
+    assert(!failed.elements.get("notice").textContent.includes("已复制"));
+    assert.equal(failed.elements.get("english").value, text);
+  }
 }
 
 class StreamService extends MockService {
@@ -587,6 +662,8 @@ async function latePreviousUserTurnCannotCarryOverWithinTheSameContext() {
   await lateReplyRetainsItsActualSettingsRevision();
   await executionTimeRevisionCanSatisfyTheNewSettings();
   await latestReadStatesAreExplicitWithoutPaidCalls();
+  await waitingChoiceStaysVisibleDuringTranslationAndClears();
+  await englishCopyUsesWholeEditedDraftWithoutAnyJob();
   await liveReplyTranslatesWhileGeneratingAndKeepsChinesePrefix();
   await liveReplyNoReadyWaitsUntilNativeGenerationFinishes();
   await liveReplyProcessesMoreThanOneChunkForTheSameNativeSnapshot();

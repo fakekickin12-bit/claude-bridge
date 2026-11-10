@@ -28,6 +28,7 @@ QWidget { color: #192E47; font-family: 'Microsoft YaHei UI'; font-size: 13px; }
 QMainWindow, QDialog { background: #EDF2F7; }
 QLabel#brand { font-size: 26px; font-weight: 700; color: #173D68; }
 QLabel#subtitle, QLabel#muted { color: #60758C; }
+QLabel#muted[attention="true"] { color: #956600; background: #FFF2BD; padding: 3px 5px; border-radius: 4px; font-weight: 600; }
 QLabel#section { font-size: 16px; font-weight: 600; }
 QLabel#badge { background: #D6E5F7; color: #285B91; padding: 7px 12px; border-radius: 12px; }
 QPlainTextEdit { background: white; border: 1px solid #CAD7E5; border-radius: 7px;
@@ -733,6 +734,8 @@ class ProjectPicker(QDialog):
         self.bridge_window.reply_original = ""
         self.bridge_window.reply_code_blocks = []
         self.bridge_window.reply_generating = False
+        self.bridge_window.reply_awaiting_input = False
+        self.bridge_window.reply_question = {}
         self.bridge_window.render_reply()
         self.bridge_window.terminal.setPlaceholderText("正在读取所选项目的最近对话…")
 
@@ -785,6 +788,8 @@ class Window(QMainWindow):
         self.reply_original = ""
         self.reply_code_blocks = []
         self.reply_generating = False
+        self.reply_awaiting_input = False
+        self.reply_question = {}
         self.reply_read_status = ""
         self.reply_read_error = ""
         self.reply_job = None
@@ -897,6 +902,14 @@ class Window(QMainWindow):
                 self.attach_button.clicked.connect(self.choose_attachments)
                 editor_header.addWidget(self.attach_button)
                 self.controls.append(self.attach_button)
+            else:
+                self.copy_english_button = QToolButton()
+                self.copy_english_button.setText("复制")
+                self.copy_english_button.setToolTip("复制当前完整英文稿")
+                self.copy_english_button.setAccessibleName("复制英文稿")
+                self.copy_english_button.setAutoRaise(True)
+                self.copy_english_button.clicked.connect(self.copy_english)
+                editor_header.addWidget(self.copy_english_button)
             box.addLayout(editor_header)
             edit = PromptEdit()
             edit.setPlaceholderText(placeholder)
@@ -955,8 +968,8 @@ class Window(QMainWindow):
         self.reply_heading = label("Claude 回复", "section")
         terminal_header.addWidget(self.reply_heading)
         self.reply_translation_status = label("", "muted")
-        terminal_header.addWidget(self.reply_translation_status)
-        terminal_header.addStretch()
+        self.reply_translation_status.setWordWrap(True)
+        terminal_header.addWidget(self.reply_translation_status, 1)
         self.reply_translate = QPushButton("自动翻译")
         self.reply_translate.setObjectName("replyTranslate")
         self.reply_translate.setCheckable(True)
@@ -1228,6 +1241,14 @@ class Window(QMainWindow):
             self.draft_source = self.source.toPlainText()
             self.note.setText("英文稿已编辑，将发送这里显示的内容。")
 
+    def copy_english(self):
+        value = self.english.toPlainText()
+        if not value.strip():
+            self.statusBar().showMessage("英文稿为空，没有可复制的内容。")
+            return
+        QApplication.clipboard().setText(value)
+        self.statusBar().showMessage("英文稿已复制。")
+
     def set_busy(self, value, message="准备就绪"):
         self.busy = value
         self.badge.setText(message)
@@ -1348,6 +1369,8 @@ class Window(QMainWindow):
             self.reply_original = ""
             self.reply_code_blocks = []
             self.reply_generating = False
+            self.reply_awaiting_input = False
+            self.reply_question = {}
             self.reply_failures.clear()
             self.render_reply()
         self.note.setText(("已匹配当前对话：" if result.get("matched") else "已切换到 " if result.get("switched") else "当前会话：") + title + "。")
@@ -1366,6 +1389,8 @@ class Window(QMainWindow):
         self.reply_original = ""
         self.reply_code_blocks = []
         self.reply_generating = False
+        self.reply_awaiting_input = False
+        self.reply_question = {}
         self.reply_failures.clear()
         self.reply_read_status = "正在匹配当前对话…"
         self.reply_read_error = ""
@@ -1699,7 +1724,10 @@ class Window(QMainWindow):
             # This is only a one-read view binding. A later read may safely follow
             # the native current page; it never submits or changes a task.
             self.pending_reply_context = ""
-        self.reply_read_status = "读取未完成，保留上次回复" if self.reply_original else "读取未完成，请重试"
+        self.reply_awaiting_input = False
+        self.reply_question = {}
+        self.reply_read_status = ("读取未完成，保留上次回复；请到 Ubuntu 查看当前任务" if self.reply_original
+                                  else "读取未完成，请到 Ubuntu 查看当前任务")
         self.reply_read_error = message
         self.terminal.setPlaceholderText("当前任务回复读取未完成：" + message)
         self.render_reply()
@@ -1776,7 +1804,13 @@ class Window(QMainWindow):
                 self.reply_translation_status.setToolTip(failure)
             if cached:
                 self.reply_translation_status.setToolTip("")
-        self.reply_translation_status.setText(" · ".join(value for value in (self.reply_read_status, status) if value))
+        waiting = "Claude 正在等待你选择，请到 Ubuntu 查看并操作。" if self.reply_awaiting_input else ""
+        attention = bool(waiting or self.reply_read_error)
+        if self.reply_translation_status.property("attention") != attention:
+            self.reply_translation_status.setProperty("attention", attention)
+            self.reply_translation_status.style().unpolish(self.reply_translation_status)
+            self.reply_translation_status.style().polish(self.reply_translation_status)
+        self.reply_translation_status.setText(" · ".join(value for value in (waiting, self.reply_read_status, status) if value))
         if self.reply_read_error:
             self.reply_translation_status.setToolTip(self.reply_read_error)
         elif not status:
@@ -1791,11 +1825,16 @@ class Window(QMainWindow):
         self.reply_turn_id = turn_id if isinstance(turn_id, str) and re.fullmatch(r"[0-9a-f]{64}", turn_id) else ""
         self.reply_original = result.get("text", "").rstrip("\r\n")
         self.reply_code_blocks = [x for x in result.get("code_blocks", []) if isinstance(x, str)]
-        self.reply_generating = bool(result.get("generating", False))
+        self.reply_awaiting_input = result.get("awaiting_input") is True
+        question = result.get("question")
+        self.reply_question = question if self.reply_awaiting_input and isinstance(question, dict) else {}
+        self.reply_generating = bool(result.get("generating", False)) and not self.reply_awaiting_input
         self.reply_read_error = ""
-        self.reply_read_status = "" if self.reply_original else result.get("read_reason") or (
+        self.reply_read_status = "" if self.reply_original or self.reply_awaiting_input else result.get("read_reason") or (
             "Claude 正在处理当前任务，暂未返回正文…" if self.reply_generating else "当前会话暂未读到 Claude 回复。")
-        self.terminal.setPlaceholderText(self.reply_read_status or "显示当前任务的回复和新增内容。拖动上方分隔条调整阅读区高度。")
+        self.terminal.setPlaceholderText(("Claude 正在等待你选择，具体选项暂未读到。请到 Ubuntu 查看并操作。"
+                                         if self.reply_awaiting_input else self.reply_read_status)
+                                        or "显示当前任务的回复和新增内容。拖动上方分隔条调整阅读区高度。")
         self.render_reply()
         self.maybe_translate_reply()
 

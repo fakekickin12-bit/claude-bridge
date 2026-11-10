@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -991,7 +991,7 @@ def reply_content(node, depth=0):
         attrs = node_attributes(node)
         classes = attrs.get("class", "").split()
         tag = attrs.get("tag", "")
-        if "sr-only" in classes or "group/status" in classes or role in {
+        if "sr-only" in classes or "group/status" in classes or "epitaxy-question-card" in classes or role in {
                 "tool bar", "status bar", "push button", "toggle button", "entry", "menu", "menu item"} or tag in {"button", "time"}:
             return ""
         children = [child for child in node if child]
@@ -1020,6 +1020,179 @@ REPLY_BODY_LIMIT = 12000
 REPLY_BODY_SECONDS = 8
 REPLY_LEAF_ROLES = {"static", "text", "link", "image", "icon", "separator"}
 REPLY_BODY_ROLES = REPLY_LEAF_ROLES | {"paragraph", "heading", "table", "table row", "list", "list item"}
+QUESTION_WAIT_REASON = "Claude 正在等待你选择，请到 Ubuntu 查看并操作。"
+
+
+def question_card_nodes(page):
+    """Find current native question cards without reading message body names."""
+    try:
+        # Native Collection queries skip the old feed bodies entirely. Questions
+        # are independent panels in the feed, not assistant message rows.
+        from gi.repository import Atspi
+        atspi = initialize()
+        collection = page.queryCollection()
+        rule = collection.createMatchRule(
+            Atspi.StateSet.new([]), Atspi.CollectionMatchType.ALL, [], Atspi.CollectionMatchType.ALL,
+            [int(atspi.ROLE_PANEL)], Atspi.CollectionMatchType.ANY,
+            [], Atspi.CollectionMatchType.ALL, False)
+        nodes = collection.getMatches(rule, Atspi.CollectionSortOrder.REVERSE_CANONICAL, 96, True)
+        found, deadline = [], time.monotonic() + 2
+        for node in nodes:
+            if time.monotonic() > deadline:
+                raise ReplyReadLimit("当前选择卡片结构尚未确认。")
+            if "epitaxy-question-card" in node_classes(node):
+                try:
+                    visible = showing(node)
+                except Exception:
+                    # Keep the recognized card for a fail-soft notice if its
+                    # accessibility object is changing during this read.
+                    visible = True
+                if visible:
+                    found.append(node)
+        if len(nodes) >= 96 and not found:
+            raise ReplyReadLimit("当前选择卡片结构尚未确认。")
+        return found
+    except Exception:
+        # Older accessibility bridges and synthetic checks use the same bounded
+        # reverse metadata reader. Stop at the latest message instead of walking
+        # back through history merely to prove that no question is present.
+        feeds, found = [], []
+        def question_visible(node, attrs):
+            if "epitaxy-question-card" not in attrs.get("class", "").split():
+                return False
+            try:
+                return showing(node)
+            except Exception:
+                return True
+        for node, role, attrs in reply_metadata_nodes(page, reverse=True, prune_feeds=True):
+            if question_visible(node, attrs):
+                found.append(node)
+            if message_feed(node, role, attrs):
+                feeds.append(node)
+        if len(feeds) == 1:
+            for node, role, attrs in reply_metadata_nodes(feeds[0], reverse=True):
+                if question_visible(node, attrs):
+                    found.append(node)
+                    break
+                if role == "article" or ("group/message-row" in attrs.get("class", "").split()
+                                         and direct_reply_payload(node)):
+                    break
+        return found
+
+
+def pending_question(page):
+    """Read a visible AskUserQuestion card only; never select or submit answers.
+
+    A recognized but unreadable card still reports waiting, so lost option
+    details never erase the instruction to finish the choice on Ubuntu.
+    """
+    empty = {"prompt": "", "page": None, "total_pages": None, "options": [],
+             "multiple": False, "actions": [], "read_status": "unavailable"}
+    try:
+        cards = question_card_nodes(page)
+    except Exception:
+        return None
+    if not cards:
+        return None
+    if len(cards) != 1:
+        return empty
+    card = cards[0]
+    remaining, deadline = [320], time.monotonic() + 4
+
+    def snapshot(node, depth=0):
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 20 or time.monotonic() > deadline:
+            raise ReplyReadLimit(QUESTION_WAIT_REASON)
+        role, attrs = node.getRoleName(), node_attributes(node)
+        classes = attrs.get("class", "").split()
+        if "sr-only" in classes or role in {"status bar", "tool bar", "menu", "menu item"}:
+            return None
+        count = node.childCount
+        if count > remaining[0]:
+            raise ReplyReadLimit(QUESTION_WAIT_REASON)
+        # Current choices are toggle buttons; previous builds may use radio or
+        # check boxes. Read the native state, never infer approval from defaults.
+        selected = None
+        if role in {"toggle button", "radio button", "check box"}:
+            state, atspi = node.getState(), initialize()
+            selected = any(state.contains(getattr(atspi, name))
+                           for name in ("STATE_PRESSED", "STATE_CHECKED", "STATE_SELECTED")
+                           if hasattr(atspi, name))
+        name = node.name if not count or node is card or role in {
+            "toggle button", "radio button", "check box", "push button"} else ""
+        if len(name) > 20000:
+            raise ReplyReadLimit(QUESTION_WAIT_REASON)
+        children = [value for index in range(count)
+                    if (value := snapshot(node.getChildAtIndex(index), depth + 1)) is not None]
+        return {"role": role, "attrs": attrs, "name": name, "selected": selected, "children": children}
+
+    def flattened(node):
+        yield node
+        for child in node["children"]:
+            yield from flattened(child)
+
+    def plain(node):
+        if node["children"]:
+            return " ".join(filter(None, (plain(child) for child in node["children"]))).strip()
+        return node["name"].strip() if node["role"] in {"static", "text", "link", "entry"} else ""
+
+    try:
+        tree = snapshot(card)
+        prompt = tree["name"].strip()
+        if not prompt:
+            raise ReplyReadLimit(QUESTION_WAIT_REASON)
+        all_nodes = list(flattened(tree))
+        options = []
+        for node in all_nodes:
+            if "epitaxy-answer-option" not in node["attrs"].get("class", "").split():
+                continue
+            choices = [child for child in flattened(node) if child["role"] in {
+                "toggle button", "radio button", "check box"}]
+            if len(choices) != 1:
+                raise ReplyReadLimit(QUESTION_WAIT_REASON)
+            choice = choices[0]
+            primary = [plain(child) for child in flattened(node)
+                       if "text-primary" in child["attrs"].get("class", "").split()]
+            secondary = [plain(child) for child in flattened(node)
+                         if "text-secondary" in child["attrs"].get("class", "").split()]
+            label = " ".join(dict.fromkeys(filter(None, primary))) or choice["name"].strip()
+            description = "\n".join(dict.fromkeys(filter(None, secondary)))
+            if not label or len(label) + len(description) > 20000:
+                raise ReplyReadLimit(QUESTION_WAIT_REASON)
+            options.append({"label": label, "description": description, "selected": choice["selected"]})
+        if not options or len(options) > 30:
+            raise ReplyReadLimit(QUESTION_WAIT_REASON)
+        pages = [match for node in all_nodes if node["role"] in {"static", "text"}
+                 if (match := re.fullmatch(r"\s*(\d+)\s+of\s+(\d+)\s*", node["name"]))]
+        page, total = (int(pages[0][1]), int(pages[0][2])) if len(pages) == 1 else (None, None)
+        if page is not None and not 1 <= page <= total <= 100:
+            raise ReplyReadLimit(QUESTION_WAIT_REASON)
+        actions = [node["name"] for node in all_nodes if node["role"] == "push button" and node["name"] in {
+            "Skip", "Next", "Submit", "Submit answers", "Show previous question", "Show next question"}]
+        if card.name.strip() != prompt or not showing(card):
+            raise ReplyReadLimit(QUESTION_WAIT_REASON)
+        return {"prompt": prompt, "page": page, "total_pages": total, "options": options,
+                "multiple": any(node["role"] == "check box" for node in all_nodes)
+                            or tree["attrs"].get("multiselectable") == "true",
+                "actions": list(dict.fromkeys(actions)), "read_status": "ready"}
+    except Exception:
+        return empty
+
+
+def question_reply_text(question):
+    """Text mirrors the visible card so existing translation can include it."""
+    if not question or question.get("read_status") != "ready":
+        return QUESTION_WAIT_REASON
+    page, total = question.get("page"), question.get("total_pages")
+    heading = "等待你选择" + (f" · 第 {page}/{total} 题" if page and total else "")
+    lines = [heading, question["prompt"]]
+    for index, option in enumerate(question["options"], 1):
+        marker = " [已选中]" if option.get("selected") is True else ""
+        lines.append(f"{index}.{marker} {option['label']}")
+        if option.get("description"):
+            lines.append("   " + option["description"].replace("\n", "\n   "))
+    lines.append("请到 Ubuntu 查看并选择。")
+    return "\n\n".join(lines)
 
 
 def message_feed(node, role=None, attrs=None):
@@ -1043,7 +1216,7 @@ def reply_metadata_nodes(root, *, reverse=False, prune_feeds=False, limit=REPLY_
         yield node, role, attrs
         classes = attrs.get("class", "").split()
         user_bubble = "group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes
-        if (role == "article" or "group/message-row" in classes or turn_boundaries and user_bubble
+        if (role == "article" or "group/message-row" in classes or "epitaxy-question-card" in classes or turn_boundaries and user_bubble
                 or role in REPLY_BODY_ROLES or role in {
                 "push button", "toggle button", "entry", "menu", "menu item", "tool bar"}
                 or "sr-only" in attrs.get("class", "").split()
@@ -1099,7 +1272,7 @@ def latest_reply_content(article):
             raise ReplyReadLimit("最后一条回复内容较多，读取尚未完成；请稍后刷新，不会扫描历史回复。")
         role, attrs = node.getRoleName(), node_attributes(node)
         classes, tag = attrs.get("class", "").split(), attrs.get("tag", "")
-        if "sr-only" in classes or "group/status" in classes or role in {
+        if "sr-only" in classes or "group/status" in classes or "epitaxy-question-card" in classes or role in {
                 "tool bar", "status bar", "push button", "toggle button", "entry", "menu", "menu item"} or tag in {"button", "time"}:
             return ""
         if tag == "br":
@@ -1138,7 +1311,7 @@ def direct_reply_payload(row):
             raise ReplyReadLimit("最后一条回复结构尚未载入，请稍后刷新。")
         role, attrs = node.getRoleName(), node_attributes(node)
         classes, tag = attrs.get("class", "").split(), attrs.get("tag", "")
-        if "sr-only" in classes or "group/status" in classes or role in {
+        if "sr-only" in classes or "group/status" in classes or "epitaxy-question-card" in classes or role in {
                 "tool bar", "status bar", "push button", "toggle button", "entry", "menu", "menu item"} or tag in {"button", "time"}:
             return False
         if role in REPLY_BODY_ROLES or tag in {"p", "pre", "blockquote", "ul", "ol", "table"}:
@@ -1444,6 +1617,7 @@ def status():
     new_target = new_code_target(attrs, controls) if new_session else None
     setup_visible = new_session and any(name.startswith("Environment: ") for name in names)
     context = conversation_context(process_id, attrs["URI"], new_target)
+    question = pending_question(page) if is_code else None
     draft = text(entry).strip()
     attachments = list(native_attachment_controls(controls, is_code))
     attachment_pending = is_code and sum(
@@ -1478,10 +1652,11 @@ def status():
     except DesktopError as exc:
         visible = False
         window_error = str(exc)
-    input_ready = bool(session_ready and enabled and not draft and not attachments and not attachment_pending
+    input_ready = bool(session_ready and enabled and not draft and not attachments and not attachment_pending and not question
                        and not busy and not dialogs and not approval and not locked)
     reason = "可以接收指令" if input_ready and visible else (
         "Ubuntu 桌面已锁定，请先解锁" if locked else
+        QUESTION_WAIT_REASON if question is not None else
         "请在 Ubuntu 的 Code 新会话中选择 This computer 和项目目录" if not session_ready else
         "Claude Code 要求重新登录。请在 Ubuntu 点 Sign in again 完成验证。" if is_code and "Sign in again" in names else
         "Claude Code 正在等待你处理提问或权限请求" if approval else
@@ -1495,6 +1670,7 @@ def status():
             "attachment_pending": bool(attachment_pending),
             "locked": bool(locked),
             "approval": approval,
+            "awaiting_input": question is not None, "question": question,
             "input_ready": input_ready, "window_visible": visible, "window_error": window_error,
             "capabilities": native_attachment_capabilities(process_id, is_code, entry, controls, visible),
             "ready": input_ready and visible, "reason": reason,
@@ -2025,13 +2201,20 @@ def dispatch(request):
         if is_code:
             page = code_panel(page)
         route = urlsplit(attrs["URI"]).path
-        reply = current_turn_reply(page, context)
-        if reply.get("read_status") == "unavailable" and (CODE_LOCAL_SESSION.fullmatch(route)
+        question = pending_question(page) if is_code else None
+        # The waiting card is the newest actionable content. Return it directly
+        # rather than reading an entire turn or waiting for its user anchor.
+        reply = ({"text": question_reply_text(question), "reply_count": 1, "message_count": 1,
+                  "code_blocks": [], "scope": "latest", "read_status": "ready", "partial": False,
+                  "read_reason": QUESTION_WAIT_REASON}
+                 if question is not None else current_turn_reply(page, context))
+        if reply.get("read_status") == "unavailable" and question is None and (CODE_LOCAL_SESSION.fullmatch(route)
                 or re.fullmatch(r"/chat/[0-9a-f-]{36}/?", route, re.IGNORECASE)):
             raise DesktopError(reply.get("read_reason") or "当前会话的最后一条回复尚未载入，请稍后刷新。")
         result = {"context": context, "route": route,
                   "title": attrs.get("Title", "Claude"), "mode": "Code" if is_code else "Chat",
-                  "generating": reply_in_progress(page), **reply}
+                  "generating": False if question is not None else reply_in_progress(page),
+                  "awaiting_input": question is not None, "question": question, **reply}
         confirm_page_context(context)
         return result
     raise DesktopError("不支持的客户端操作。")

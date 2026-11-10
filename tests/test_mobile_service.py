@@ -1130,6 +1130,65 @@ def test_capture_turn_identity_is_validated_without_breaking_legacy_reads(backen
     assert backend.service.reply["turn_id"] == expected
 
 
+def test_waiting_choice_card_is_read_only_translatable_and_clears_on_completion(backend):
+    question = {"prompt": "Which narrator voice should be used?", "page": 1, "total_pages": 3,
+                "options": [{"label": "Man, 45-55 (Recommended)", "description": "Warm storyteller.", "selected": True},
+                            {"label": "Woman, 40-55", "description": "Female storyteller.", "selected": False}],
+                "multiple": False, "actions": ["Skip", "Next"], "private_unlisted_field": "never expose"}
+    backend.remote.reply = {"text": "", "mode": "Code", "generating": True,
+                            "awaiting_input": True, "question": question}
+    backend.service.capture()
+    reply = backend.service.reply
+    assert reply["awaiting_input"] and not reply["generating"] and reply["read_status"] == "waiting_input"
+    assert "Which narrator" in reply["text"] and "Warm storyteller." in reply["text"] and "尚未提交" in reply["text"]
+    assert reply["source_hash"] == hashlib.sha256(reply["text"].encode()).hexdigest()
+    assert "private_unlisted_field" not in reply["question"]
+    assert backend.service.target["awaiting_input"] and backend.service.target["ready"] is False
+    assert backend.service.target["busy"] is False and "请到 Ubuntu" in backend.service.target["reason"]
+    assert backend.remote.count("probe") == 0 and backend.remote.count("send") == 0
+    public = backend.service.public_state("synthetic-csrf")
+    assert public["reply"]["question"] == reply["question"] and public["reply"]["awaiting_input"]
+    first = run(backend, request("translate_reply", source_hash=reply["source_hash"]))
+    assert first["state"] == "translated" and len(backend.translator.reply_translations) == 1
+    backend.service.capture()
+    repeated = run(backend, request("translate_reply", source_hash=reply["source_hash"]))
+    assert repeated["result"]["cached"] and len(backend.translator.reply_translations) == 1
+    backend.remote.reply = {"text": "The choice is complete.", "mode": "Code", "generating": False}
+    backend.service.capture()
+    assert not backend.service.reply["awaiting_input"] and backend.service.reply["question"] is None
+    assert not backend.service.target["awaiting_input"] and backend.service.target["ready"] is True
+    assert backend.remote.count("probe") == 1 and backend.remote.count("send") == 0
+
+
+def test_waiting_marker_without_readable_options_still_has_visible_source(backend):
+    backend.remote.reply = {"text": "", "mode": "Code", "generating": True,
+                            "awaiting_input": True, "question": {}}
+    backend.service.capture()
+    assert backend.service.reply["text"] == "Claude 正在等待你选择，请到 Ubuntu 查看并操作。"
+    assert backend.service.reply["source_hash"] and backend.service.reply["question"] == {}
+    assert backend.service.reply["awaiting_input"] and not backend.service.reply["generating"]
+    before = dict(backend.service.reply)
+    with pytest.raises(core.BridgeError):
+        backend.service.accept_capture({"context": "f" * 64, "text": "Other task choice", "awaiting_input": True}, CONTEXT)
+    assert backend.service.reply == before
+    backend.service.capture_failed("请到 Ubuntu 查看当前会话。")
+    assert not backend.service.reply.get("awaiting_input") and not backend.service.reply.get("question")
+    assert not backend.service.target.get("awaiting_input")
+
+
+def test_question_metadata_is_bounded_and_whitelisted():
+    question = mobile.safe_question({"prompt": "p" * 9000, "page": True, "total_pages": 3,
+        "options": [{"label": "l" * 3000, "description": "d" * 5000, "selected": 1,
+                     "private_field": "never expose"}] * 30,
+        "multiple": "true", "actions": ["Next", {"private": "field"}], "private_field": "never expose"})
+    assert len(question["prompt"]) == 8000 and len(question["options"]) == 20
+    assert len(question["options"][0]["label"]) == 2000 and len(question["options"][0]["description"]) == 4000
+    assert question["options"][0]["selected"] is None and question["page"] is None
+    assert question["total_pages"] is None and not question["multiple"] and question["actions"] == ["Next"]
+    assert "private_field" not in json.dumps(question)
+    assert mobile.safe_question({"prompt": "Question", "options": [None, {"label": 123}]}) is None
+
+
 def test_live_reply_reuses_old_whole_reply_cache_as_incremental_prefix(backend):
     first = "A finished reply already translated in the previous version."
     payload = live_reply(backend, first)

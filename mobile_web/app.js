@@ -32,7 +32,7 @@
     sessionPicker: byId("session-picker"), session: byId("session-select"),
     enterSession: byId("enter-session-button"),
     desktopOpen: byId("desktop-open-button"),
-    source: byId("source"), english: byId("english"), draftState: byId("draft-state"),
+    source: byId("source"), english: byId("english"), draftState: byId("draft-state"), copyEnglish: byId("english-copy-button"),
     attach: byId("attach-button"), fileInput: byId("file-input"), attachments: byId("attachment-list"),
     attachmentHint: byId("attachment-hint"), autoEnter: byId("auto-enter"),
     translate: byId("translate-button"), send: byId("send-button"), translateSend: byId("translate-send-button"),
@@ -62,6 +62,7 @@
   let pendingReplyJob = null;
   let lastUncertain = null;
   let posting = false;
+  let copyingEnglish = false;
   let stateRequest = null;
   let jobRequest = null;
   let historyRequest = null;
@@ -502,7 +503,7 @@
     const ready = online && target.ready;
     renderConnection(online, online ? "已连接" : "电脑离线");
     const mode = target.mode === "Code" ? "Claude Code" : target.mode === "Chat" ? "Claude Chat" : "Claude";
-    ui.targetState.textContent = !online ? "电脑离线" : ready ? "可以发送" : target.busy ? "正在执行任务" : "等待就绪";
+    ui.targetState.textContent = !online ? "电脑离线" : ready ? "可以发送" : target.awaiting_input === true ? "等待你选择" : target.busy ? "正在执行任务" : "等待就绪";
     ui.targetState.className = `status-pill ${ready ? "ready" : "blocked"}`;
     ui.targetTitle.textContent = target.title ? `${mode} · ${target.project_title ? `${target.project_title} / ` : ""}${target.title}` : mode;
     const detail = !online ? "请确认 Windows 桥接服务正在运行" : ready ? target.workspace || "沿用 Ubuntu 当前打开的会话" :
@@ -694,6 +695,7 @@
     ui.send.disabled = !ready || !profileReady || !ui.english.value.trim() || boundSource !== ui.source.value || Boolean(uncertainDraft);
     ui.translateSend.disabled = !ready || !profileReady || !ui.source.value.trim() || Boolean(uncertainDraft);
     ui.newButton.disabled = !ready;
+    if (ui.copyEnglish) ui.copyEnglish.disabled = copyingEnglish || !ui.english.value.trim();
     ui.attach.disabled = !authenticated || !connected || !online || Boolean(pendingJob || posting);
     ui.attach.title = supportsAttachments() ? "载入附件" : "查看 Code 会话的附件支持说明";
     ui.profile.disabled = Boolean(pendingJob || posting);
@@ -704,6 +706,23 @@
     renderRecovery();
     renderAvailableUpdate();
     renderProjectControls();
+  }
+
+  async function copyEnglish() {
+    const text = ui.english.value;
+    if (copyingEnglish || !text.trim()) return;
+    copyingEnglish = true;
+    renderControls();
+    try {
+      if (typeof globalThis.navigator?.clipboard?.writeText !== "function") throw new Error("Clipboard unavailable");
+      await globalThis.navigator.clipboard.writeText(text);
+      showNotice("已复制英文稿。");
+    } catch (_) {
+      showNotice("无法自动复制，请长按或选择英文稿，手动全选后复制。", true);
+    } finally {
+      copyingEnglish = false;
+      renderControls();
+    }
   }
 
   function makeId() {
@@ -1015,7 +1034,9 @@
     const reading = serverState?.reply || {};
     const readingContextMatches = (!replyNavigation?.context || reading.context === replyNavigation.context) &&
       (!reading.context || !serverState?.target?.context || reading.context === serverState.target.context);
-    const readError = readingContextMatches ? reading.error || (reading.read_status === "error" ? reading.read_reason : "") || "" : "";
+    const rawReadError = readingContextMatches ? reading.error || (reading.read_status === "error" ? reading.read_reason : "") || "" : "";
+    const readError = rawReadError && !/Ubuntu.*(?:查看|显示|操作)|(?:查看|显示|操作).*Ubuntu/.test(rawReadError) ?
+      `${rawReadError} 请到 Ubuntu 查看当前任务。` : rawReadError;
     const key = replyKey();
     const translated = translatedReplies.get(key);
     const original = typeof reply.text === "string" ? reply.text : "";
@@ -1045,6 +1066,10 @@
     } else if (!readError && reply.read_status === "empty") {
       status = reply.read_reason || "当前会话还没有 Claude 回复。";
     }
+    if (!readError && !reply.loading && reply.awaiting_input === true) {
+      const waiting = "Claude 正在等待你选择，请到 Ubuntu 查看并操作。";
+      status = status ? `${waiting} · ${status}` : waiting;
+    }
     ui.replyHeading.textContent = (reply.mode || serverState?.target?.mode) === "Code" ? "Claude Code 回复" : "Claude 回复";
     const replyBody = ui.replyText.parentElement;
     const atEnd = replyBody.scrollHeight - replyBody.scrollTop - replyBody.clientHeight < 40;
@@ -1058,6 +1083,7 @@
       matched ? "当前任务的回复内容会显示在这里。" : "正在确认所选会话的回复…");
     ui.replyText.hidden = !content;
     ui.replyStatus.textContent = status;
+    ui.replyStatus.classList.toggle("warning", Boolean(readError) || (!reply.loading && reply.awaiting_input === true));
     ui.replyToggle.setAttribute("aria-pressed", String(replyTranslated));
     ui.replyUpdated.textContent = reply.updated_at ? `更新于 ${formatTime(reply.updated_at, false)}` : "";
     if (reply.source_hash && lastReplyHash && reply.source_hash !== lastReplyHash && activeTab !== "reply") ui.replyNew.hidden = false;
@@ -1361,6 +1387,7 @@
     ensureReplyTranslation();
   });
   ui.translate.addEventListener("click", () => createJob("translate"));
+  ui.copyEnglish?.addEventListener("click", copyEnglish);
   ui.send.addEventListener("click", () => createJob("send"));
   ui.translateSend.addEventListener("click", () => createJob("translate_send"));
   ui.newButton.addEventListener("click", () => createJob("new"));
