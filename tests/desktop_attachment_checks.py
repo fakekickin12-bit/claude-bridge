@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,6 +38,60 @@ def fails(operation):
     raise AssertionError("Unsafe attachment state was accepted")
 
 
+# A read-only transport preflight may inspect window properties, but may not
+# create a window, own a selection, inject input, send XDND, or change focus.
+xlib, extension = ModuleType("Xlib"), ModuleType("Xlib.ext")
+xlib.X = SimpleNamespace(AnyPropertyType=0, IsViewable=2)
+xlib.Xatom = SimpleNamespace(ATOM=4)
+window = SimpleNamespace(
+    get_wm_class=Mock(return_value=("claude", "Claude")),
+    get_attributes=Mock(return_value=SimpleNamespace(map_state=2)),
+)
+properties = {
+    "_NET_WM_PID": SimpleNamespace(value=[42]),
+    "XdndAware": SimpleNamespace(value=[5], property_type=4, format=32),
+}
+window.get_full_property = Mock(side_effect=lambda atom, kind: properties.get(atom))
+connection = SimpleNamespace(
+    create_resource_object=Mock(return_value=window), intern_atom=lambda name: name,
+    has_extension=Mock(return_value=True), close=Mock(),
+)
+xlib.display = SimpleNamespace(Display=Mock(return_value=connection))
+xlib.protocol = SimpleNamespace(event=SimpleNamespace(ClientMessage=Mock(side_effect=AssertionError("Native protocol event was constructed"))))
+extension.xtest = SimpleNamespace(fake_input=Mock(side_effect=AssertionError("Native input was injected")))
+with patch.dict(sys.modules, {"Xlib": xlib, "Xlib.ext": extension}), \
+     patch.object(d, "window_id", return_value=100) as selected_window, \
+     patch.object(d, "environment", return_value={"DISPLAY": "synthetic"}):
+    assert d.attachment_transport_probe(42) == {"ready": True, "reason": ""}
+    connection.create_resource_object.assert_called_with("window", 100)
+    connection.close.assert_called_once()
+    for field, invalid in [
+        ("_NET_WM_PID", None), ("_NET_WM_PID", SimpleNamespace(value=[41])),
+        ("_NET_WM_PID", SimpleNamespace(value=[42, 43])), ("XdndAware", None),
+        ("XdndAware", SimpleNamespace(value=[2], property_type=4, format=32)),
+        ("XdndAware", SimpleNamespace(value=[5], property_type=99, format=32)),
+        ("XdndAware", SimpleNamespace(value=[5], property_type=4, format=8)),
+        ("XdndAware", SimpleNamespace(value=[5, 5], property_type=4, format=32)),
+    ]:
+        original = properties[field]; properties[field] = invalid
+        assert d.attachment_transport_probe(42)["ready"] is False
+        properties[field] = original
+    with patch.object(window, "get_attributes", return_value=SimpleNamespace(map_state=0)):
+        assert d.attachment_transport_probe(42)["ready"] is False
+    with patch.object(window, "get_wm_class", return_value=("unrelated",)):
+        assert d.attachment_transport_probe(42)["ready"] is False
+    with patch.object(connection, "has_extension", return_value=False):
+        assert d.attachment_transport_probe(42)["ready"] is False
+    with patch.object(d, "window_id", side_effect=d.DesktopError("Ambiguous Claude windows")):
+        result = d.attachment_transport_probe(42)
+        assert not result["ready"] and result["reason"] == "Ambiguous Claude windows"
+    assert d.attachment_transport_probe(0)["ready"] is False
+    xlib.protocol.event.ClientMessage.assert_not_called()
+    extension.xtest.fake_input.assert_not_called()
+with patch.dict(sys.modules, {"Xlib": None}):
+    assert d.attachment_transport_probe(42)["ready"] is False
+
+
 paths = [str(Path.home() / "bridge-test" / "unique.png"), str(Path.home() / "bridge-test" / "unique.txt")]
 labels = ["unique.png", "~/bridge-test/unique.txt"]
 assert d.match_native_attachments(labels, paths) == dict(zip(paths, labels))
@@ -65,13 +119,29 @@ with tempfile.TemporaryDirectory(prefix="bridge-native-check-") as directory:
     root = Path(directory)
     signature = {"schema": 1, "synthetic": True}
     with patch.object(d, "ROOT", root), patch.object(r, "ROOT", root), \
-         patch.object(d, "attachment_support_signature", return_value=signature):
-        assert d.native_attachment_capabilities(42, True, None, None, True) == {"native_attachments": False}
+         patch.object(d, "attachment_support_signature", return_value=signature), \
+         patch.object(d, "attachment_transport_probe", return_value={"ready": True, "reason": ""}) as transport:
+        # A fresh install has no private verification marker. Eligibility means
+        # current native structure plus the current window's XDND transport,
+        # never that a particular file is already loaded or approved.
+        assert d.native_attachment_capabilities(42, True, None, None, True) == {"native_attachments": True}
         r.atomic(root / "native-attachment-support.json", signature)
         assert d.native_attachment_capabilities(42, True, None, None, True) == {"native_attachments": True}
-        assert d.native_attachment_capabilities(42, True, None, None, False) == {"native_attachments": False}
+        assert d.native_attachment_capabilities(42, True, None, None, False)["native_attachments"] is False
         r.atomic(root / "native-attachment-support.json", {"schema": 2})
-        assert d.native_attachment_capabilities(42, True, None, None, True) == {"native_attachments": False}
+        marker_before = (root / "native-attachment-support.json").read_bytes()
+        assert d.native_attachment_capabilities(42, True, None, None, True) == {"native_attachments": True}
+        assert (root / "native-attachment-support.json").read_bytes() == marker_before
+        with patch.object(d, "attachment_support_signature", return_value=None):
+            transport.reset_mock()
+            unsupported = d.native_attachment_capabilities(42, True, None, None, True)
+            assert unsupported["native_attachments"] is False and unsupported["attachment_reason"]
+            transport.assert_not_called()
+        with patch.object(d, "attachment_support_signature", side_effect=RuntimeError("Native shape changed")):
+            assert d.native_attachment_capabilities(42, True, None, None, True)["native_attachments"] is False
+        with patch.object(d, "attachment_transport_probe", return_value={"ready": False, "reason": "Synthetic transport missing"}):
+            unsupported = d.native_attachment_capabilities(42, True, None, None, True)
+            assert unsupported == {"native_attachments": False, "attachment_reason": "Synthetic transport missing"}
 
         uri = "https://claude.ai/epitaxy/local_12345678-1234-1234-1234-123456789abc"
         context = d.conversation_context(42, uri)
@@ -80,7 +150,7 @@ with tempfile.TemporaryDirectory(prefix="bridge-native-check-") as directory:
                  "dialogs": [], "approval": False, "attachment_pending": False,
                  "capabilities": {"native_attachments": True}}
         initial = {**state, "ready": True}
-        for change in ({"locked": True}, {"window_visible": False}, {"approval": True}, {"busy": True}):
+        for change in ({"locked": True}, {"window_visible": False}, {"approval": True}, {"busy": True}, {"awaiting_input": True}):
             fails(lambda: d.require_attachment_draft({**state, **change}, context, [], ""))
         assert d.project_target_summary(state)["capabilities"] == {"native_attachments": True}
         rid = "a" * 32
@@ -167,4 +237,4 @@ with tempfile.TemporaryDirectory(prefix="bridge-native-check-") as directory:
             fails(lambda: d.send({**request, "request_id": "d" * 32}))
             assert not never_paste.called
 
-print("Native attachment guards: capability proof, exact path/chip matching, draft-only receipt, owned cleanup, and stale/user changes OK")
+print("Native attachment guards: read-only current transport eligibility, exact per-delivery path/chip matching, draft-only receipt, owned cleanup, and stale/user/question changes OK")

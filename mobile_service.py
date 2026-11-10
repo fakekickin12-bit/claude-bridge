@@ -86,6 +86,12 @@ def question_text(question):
     return "\n\n".join(parts)
 
 
+def attachment_reason(target, fallback):
+    capabilities = target.get("capabilities")
+    reason = capabilities.get("attachment_reason") if isinstance(capabilities, dict) else None
+    return reason.strip()[:500] if isinstance(reason, str) and reason.strip() else fallback
+
+
 class RequestSizeLimit:
     """Bound streamed bodies before multipart parsing creates temporary files."""
 
@@ -697,7 +703,12 @@ class MobileBridge:
             "project_title", "session_title")}
         result["awaiting_input"] = target.get("awaiting_input") is True
         result["draft_chars"] = target.get("draft_chars", len(target.get("draft", "")))
-        result["capabilities"] = {"native_attachments": (target.get("capabilities") or {}).get("native_attachments") is True}
+        capabilities = target.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        result["capabilities"] = {"native_attachments": capabilities.get("native_attachments") is True}
+        reason = attachment_reason(target, "")
+        if not result["capabilities"]["native_attachments"] and reason:
+            result["capabilities"]["attachment_reason"] = reason
         return result
 
     def projects(self, refresh=False):
@@ -1102,7 +1113,7 @@ class MobileBridge:
                     return True
                 if (payload["attachment_ids"] and ready.get("mode") == "Code"
                         and (ready.get("capabilities") or {}).get("native_attachments") is not True):
-                    raise core.BridgeError("当前 Code 客户端的附件载入尚未就绪，请刷新连接状态后重试。")
+                    raise core.BridgeError(attachment_reason(ready, "当前 Code 客户端的附件载入尚未就绪，请刷新连接状态后重试。"))
                 if action == "translate_send":
                     self.update_job(job_id, "running", "正在翻译")
                     result = self.translator(payload["profile"]).translate(payload["source"])
@@ -1402,7 +1413,7 @@ def create_app(data_dir, public_origin, *, start_worker=True, bridge=None):
         with service.lock:
             if (service.target.get("mode") == "Code"
                     and (service.target.get("capabilities") or {}).get("native_attachments") is not True):
-                raise HTTPException(400, "当前 Code 客户端的附件载入尚未就绪，请刷新连接状态后重试。")
+                raise HTTPException(400, attachment_reason(service.target, "当前 Code 客户端的附件载入尚未就绪，请刷新连接状态后重试。"))
         form = await request.form(max_files=1, max_fields=1)
         item = form.get("file")
         if item is None or not hasattr(item, "read"):

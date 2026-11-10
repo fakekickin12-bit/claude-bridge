@@ -92,6 +92,7 @@ def main():
             config = core.defaults()
             config["ssh"]["host"] = "synthetic-host"
             config["auto_translate_reply"] = False
+            core.atomic_json(data / "config.json", config)
             remote = Remote()
             with patch.object(desktop, "DATA_DIR", data), patch.object(core, "DATA_DIR", data), \
                  patch.object(desktop, "load_config", return_value=copy.deepcopy(config)), \

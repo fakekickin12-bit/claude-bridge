@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.14.1"
+VERSION = "1.14.2"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -396,7 +396,7 @@ def focus_composer(expected_context=None, expected_draft=""):
             if current["context"] != expected_context:
                 raise DesktopError("聚焦后发现客户端已切换对话。尚未提交消息，请检查目标对话。")
             if (current["draft"] != expected_draft or current["dialogs"]
-                    or current["busy"] or current["approval"]):
+                    or current["busy"] or current["approval"] or current.get("awaiting_input", False)):
                 raise DesktopError("聚焦时客户端已有草稿、弹窗或任务。已停止输入。")
         time.sleep(.15)
         return wid
@@ -538,7 +538,7 @@ def native_attachment_controls(controls, is_code=False):
 
 
 def attachment_support_signature(process_id, entry, controls):
-    """Version/AX identity used only after an explicit native attachment check."""
+    """Current executable/AX identity, not proof that any attachment was loaded."""
     additions = [n for n in buttons(controls) if showing(n) and n.name == "Add"]
     if len(additions) != 1:
         return None
@@ -559,16 +559,62 @@ def attachment_support_signature(process_id, entry, controls):
             "remove_prefix": "Remove ", "code_shelf": "epitaxy-attachment-shelf"}
 
 
-def native_attachment_capabilities(process_id, is_code, entry, controls, visible):
-    supported = not is_code and visible
-    if is_code and visible:
-        signature = attachment_support_signature(process_id, entry, controls)
+def attachment_transport_probe(process_id):
+    """Read only the unique current Claude window's owner and XDND support.
+
+    This is a transport preflight, not an attachment receipt. Each delivery must
+    still complete XDND and confirm its exact native chips before submission.
+    """
+    try:
+        from Xlib import X, Xatom, display, protocol
+        from Xlib.ext import xtest
+        if not isinstance(process_id, int) or isinstance(process_id, bool) or process_id <= 0:
+            raise DesktopError("Claude 进程身份尚未确认，已停止附件载入。")
+        wid = window_id()
+        connection = display.Display(environment()["DISPLAY"])
         try:
-            verified = json.loads((ROOT / "native-attachment-support.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            verified = None
-        supported = signature is not None and verified == signature
-    return {"native_attachments": bool(supported)}
+            window = connection.create_resource_object("window", wid)
+            owner = window.get_full_property(connection.intern_atom("_NET_WM_PID"), X.AnyPropertyType)
+            classes = window.get_wm_class() or ()
+            if (window.get_attributes().map_state != X.IsViewable or owner is None
+                    or len(owner.value) != 1 or int(owner.value[0]) != process_id
+                    or not any("claude" in name.lower() for name in classes)):
+                raise DesktopError("Claude 附件目标窗口已经变化，请到 Ubuntu 查看后重试。")
+            aware = window.get_full_property(connection.intern_atom("XdndAware"), X.AnyPropertyType)
+            if (aware is None or aware.property_type != Xatom.ATOM or aware.format != 32
+                    or len(aware.value) != 1 or not 3 <= int(aware.value[0]) <= 0xffffffff):
+                raise DesktopError("当前 Claude 窗口尚未提供兼容的文件拖放接口，请到 Ubuntu 查看。")
+            if not connection.has_extension("XTEST"):
+                raise DesktopError("Ubuntu 当前桌面缺少附件输入所需的 X11 扩展，请到 Ubuntu 查看。")
+            # Importing these objects above confirms that both focus and XDND
+            # protocol modules used by drop_files are available, without input.
+            if not callable(protocol.event.ClientMessage) or not callable(xtest.fake_input):
+                raise DesktopError("Ubuntu 附件传输组件尚未就绪，请到 Ubuntu 查看。")
+            return {"ready": True, "reason": ""}
+        finally:
+            connection.close()
+    except DesktopError as exc:
+        return {"ready": False, "reason": str(exc)}
+    except Exception:
+        return {"ready": False, "reason": "Ubuntu 当前桌面的文件拖放传输不可用，请到 Ubuntu 查看。"}
+
+
+def native_attachment_capabilities(process_id, is_code, entry, controls, visible):
+    if not visible:
+        return {"native_attachments": False, "attachment_reason": "Ubuntu Claude 窗口当前不可见，请先打开客户端。"}
+    if not is_code:
+        return {"native_attachments": True}
+    try:
+        signature = attachment_support_signature(process_id, entry, controls)
+    except Exception:
+        signature = None
+    if signature is None:
+        return {"native_attachments": False,
+                "attachment_reason": "当前 Code 输入区或添加附件控件尚未可靠识别，请到 Ubuntu 查看。"}
+    transport = attachment_transport_probe(process_id)
+    if not transport["ready"]:
+        return {"native_attachments": False, "attachment_reason": transport["reason"]}
+    return {"native_attachments": True}
 
 
 def match_native_attachments(names, paths, partial=False):
@@ -590,7 +636,7 @@ def match_native_attachments(names, paths, partial=False):
 
 def require_attachment_draft(state, context, paths, draft, partial=False):
     if (state["context"] != context or state["draft"] != draft or state["dialogs"]
-            or state["busy"] or state["approval"] or state.get("locked", False)
+            or state["busy"] or state["approval"] or state.get("awaiting_input", False) or state.get("locked", False)
             or not state.get("window_visible", True)):
         raise DesktopError("客户端对话、草稿或任务状态已经改变，已停止附件操作。")
     if not partial and state.get("attachment_pending"):
@@ -1964,7 +2010,7 @@ def cleanup_attachment_draft(request):
         for _ in range(30):
             current = status()
             if (current["context"] != context or current["attachments"] or current["busy"] or current["dialogs"]
-                    or current["approval"] or current.get("attachment_pending")):
+                    or current["approval"] or current.get("awaiting_input", False) or current.get("attachment_pending")):
                 raise DesktopError("清理时客户端状态已经变化，请查看 Ubuntu。")
             if not current["draft"]:
                 record.update(state="cleared", cleared_at=time.time())
@@ -1997,7 +2043,8 @@ def send(request):
         initial = check_ready(request)
         if (initial.get("mode") == "Code" and request.get("attachment_batch")
                 and not initial.get("capabilities", {}).get("native_attachments", False)):
-            error = DesktopError("当前 Code 客户端尚未通过原生附件校验，已停止载入。")
+            error = DesktopError(initial.get("capabilities", {}).get("attachment_reason")
+                                 or "当前 Code 附件传输不可用，请到 Ubuntu 查看；尚未载入或提交。")
             error.not_submitted = True
             raise error
         paths = attachment_paths(request)
@@ -2035,7 +2082,8 @@ def send(request):
             current = status()
             require_attachment_draft(current, initial["context"], paths, value.strip())
             if (current["context"] != initial["context"] or current["draft"] != value.strip()
-                    or current["dialogs"] or current["approval"] or current["busy"] or not showing(send_button)):
+                    or current["dialogs"] or current["approval"] or current.get("awaiting_input", False)
+                    or current["busy"] or not showing(send_button)):
                 raise DesktopError("提交前客户端内容已改变，已停止发送。")
             record["state"] = "submitting"
             remote.atomic(ledger, record)

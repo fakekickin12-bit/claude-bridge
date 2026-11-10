@@ -35,6 +35,7 @@ class FakeRemote:
         self.context = CONTEXT
         self.mode = "Chat"
         self.native_attachments = False
+        self.attachment_reason = ""
         self.receipts = {}
         self.calls = []
         self.send_error = None
@@ -61,7 +62,8 @@ class FakeRemote:
             if kwargs["context"] != self.context:
                 raise core.BridgeError("Synthetic stale target")
             return {"context": self.context, "ready": True, "mode": self.mode,
-                    "capabilities": {"native_attachments": self.native_attachments}}
+                    "capabilities": {"native_attachments": self.native_attachments,
+                                     **({"attachment_reason": self.attachment_reason} if self.attachment_reason else {})}}
         if action == "send":
             if self.send_error:
                 raise self.send_error
@@ -1221,6 +1223,39 @@ def test_code_attachment_job_rejected_before_translation_or_upload(backend):
     assert "Code" in result["error"]
     assert backend.translator.translations == []
     assert backend.remote.count("send") == 0
+
+
+def test_code_attachment_reason_is_whitelisted_and_used_without_upload_or_translation(backend):
+    reason = "当前 Claude 窗口未开放 XDND 文件拖入，请在 Ubuntu 显示客户端后重试。"
+    target = backend.service.safe_target({"context": CONTEXT, "mode": "Code", "ready": True,
+        "password": "private-target-value", "capabilities": {"native_attachments": False,
+        "attachment_reason": " " + reason + " ", "private_capability": "never expose"}})
+    assert target["capabilities"] == {"native_attachments": False, "attachment_reason": reason}
+    backend.service.target = target
+    public = backend.service.public_state("synthetic-csrf")
+    assert public["target"]["capabilities"]["attachment_reason"] == reason
+    assert "private_capability" not in json.dumps(public["target"])
+    assert "private-target-value" not in json.dumps(public["target"])
+    response = backend.client.post("/api/uploads", headers=login(backend),
+        files={"file": ("synthetic.png", b"No file is stored", "image/png")})
+    assert response.status_code == 400 and response.json()["detail"] == reason
+    assert not (backend.service.directory / "uploads").exists()
+    backend.remote.mode = "Code"
+    backend.remote.attachment_reason = "当前原生附件区结构尚未识别，请到 Ubuntu 查看。"
+    result = run(backend, request("translate_send", expected_context=CONTEXT, attachment_ids=["d" * 32]))
+    assert result["state"] == "failed" and result["error"] == backend.remote.attachment_reason
+    assert backend.translator.translations == [] and backend.remote.count("send") == 0
+    assert not (backend.service.directory / "uploads").exists()
+
+
+@pytest.mark.parametrize("reason", [None, 123, {"private": "field"}])
+def test_attachment_reason_is_bounded_and_non_text_diagnostics_are_ignored(reason):
+    target = {"mode": "Code", "capabilities": {"native_attachments": False, "attachment_reason": reason}}
+    assert mobile.MobileBridge.safe_target(target)["capabilities"] == {"native_attachments": False}
+    assert mobile.attachment_reason(target, "Generic fallback") == "Generic fallback"
+    long = {"mode": "Code", "capabilities": {"native_attachments": False, "attachment_reason": "x" * 900}}
+    assert len(mobile.MobileBridge.safe_target(long)["capabilities"]["attachment_reason"]) == 500
+    assert len(mobile.attachment_reason(long, "Generic fallback")) == 500
 
 
 def test_verified_code_attachment_uses_same_upload_and_draft_only_delivery(backend, monkeypatch):

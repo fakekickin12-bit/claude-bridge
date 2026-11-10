@@ -646,9 +646,14 @@
     return target?.mode !== "Code" || target?.capabilities?.native_attachments === true;
   }
 
+  function attachmentReason(fallback) {
+    const reason = serverState?.target?.capabilities?.attachment_reason;
+    return typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 500) : fallback;
+  }
+
   function chooseAttachments() {
     if (!supportsAttachments()) {
-      showNotice("当前 Code 会话尚未支持从手机载入附件。请在 Ubuntu 的 Code 窗口内添加并发送。", true);
+      showNotice(attachmentReason("当前 Code 会话尚未支持从手机载入附件。请在 Ubuntu 的 Code 窗口内添加并发送。"), true);
       return;
     }
     ui.fileInput.click();
@@ -1259,7 +1264,7 @@
       return;
     }
     if (!supportsAttachments()) {
-      showNotice("Code 会话请在 Ubuntu 内添加附件。", true);
+      showNotice(attachmentReason("Code 会话请在 Ubuntu 内添加附件。"), true);
       return;
     }
     if (!authenticated) return;

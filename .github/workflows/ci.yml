@@ -37,6 +37,8 @@ jobs:
           python tests/reply_ui_smoke.py
           python tests/desktop_web_menu_ui.py
           python tests/desktop_question_copy_ui.py
+          python tests/desktop_attachment_support_ui.py
+          python tests/desktop_delivery_ui.py
       - name: Mobile UI
         run: |
           node tests/mobile_reply_ui.js

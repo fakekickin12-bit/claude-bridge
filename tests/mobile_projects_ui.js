@@ -51,6 +51,7 @@ class ProjectService {
     this.catalogUrls = [];
     this.loadingReads = 0;
     this.nativeAttachments = undefined;
+    this.attachmentReason = undefined;
     this.posts = [];
     this.jobs = new Map();
     this.context = "c".repeat(64);
@@ -95,7 +96,7 @@ class ProjectService {
   state() {
     return {csrf: "synthetic-csrf", profiles: [{id: "synthetic", label: "Synthetic API", kind: "api", model: "synthetic"}],
       default_profile: "synthetic", target: {mode: this.mode, ready: this.ready, busy: true, reason: "Synthetic inline question", context: this.context, title: this.currentTitle, project_title: this.projectTitle,
-        capabilities: {native_attachments: this.nativeAttachments}},
+        capabilities: {native_attachments: this.nativeAttachments, attachment_reason: this.attachmentReason}},
       worker: {online: true, busy: false}, reply: clone(this.reply), active_job: null};
   }
 
@@ -377,6 +378,41 @@ async function pendingBlocksNavigationAndCodeExplainsAttachments() {
   service.uploadRelease();
   await settle(() => page.draft().attachments?.length === 1, "Chat upload completion");
   assert.equal(page.draft().source, page.initial.source);
+}
+
+async function nativeAttachmentReasonBlocksPickerAndFileStaging() {
+  const service = new ProjectService();
+  service.nativeAttachments = false;
+  service.attachmentReason = "当前 Claude 窗口未开放 XDND 文件拖入，请在 Ubuntu 显示客户端后重试。";
+  const page = browser(service);
+  await settle(() => page.elements.get("profile-select").value === "synthetic", "native attachment diagnostic startup");
+  page.click("attach-button");
+  assert.equal(page.elements.get("notice").textContent, service.attachmentReason);
+  assert.equal(page.elements.get("file-input").clicks, 0);
+  const file = new Blob(["not uploaded"], {type: "image/png"}); file.name = "synthetic.png";
+  page.elements.get("file-input").files = [file];
+  page.elements.get("file-input").dispatch("change");
+  assert.equal(page.elements.get("notice").textContent, service.attachmentReason);
+  assert.equal(service.uploadRelease, null);
+  assert.equal(service.posts.length, 0);
+  service.attachmentReason = {private: "never stringify"};
+  service.currentTitle = "Fresh diagnostic fixture"; page.poll(5000);
+  await settle(() => page.elements.get("target-title").textContent.includes(service.currentTitle), "non-text diagnostic refresh");
+  page.click("attach-button");
+  assert.match(page.elements.get("notice").textContent, /Code.*附件/);
+  assert(!page.elements.get("notice").textContent.includes("private"));
+  service.attachmentReason = "x".repeat(900);
+  service.currentTitle = "Bounded diagnostic fixture"; page.poll(5000);
+  await settle(() => page.elements.get("target-title").textContent.includes(service.currentTitle), "bounded diagnostic refresh");
+  page.click("attach-button");
+  assert.equal(page.elements.get("notice").textContent.length, 500);
+  service.nativeAttachments = true;
+  service.currentTitle = "Native transport available"; page.poll(5000);
+  await settle(() => page.elements.get("target-title").textContent.includes(service.currentTitle), "available native transport refresh");
+  page.click("attach-button");
+  assert.equal(page.elements.get("file-input").clicks, 1, "A stale reason cannot override current boolean capability");
+  assert.equal(service.uploadRelease, null);
+  assert.equal(service.posts.length, 0);
 }
 
 async function unknownIgnoresInflightOldState() {
@@ -677,6 +713,7 @@ async function unknownMatchHasNoDeliveryReceipt() {
   assert.equal(desktopPage.draft().english, desktopDraft.english);
   await explicitProjectAndSessionNavigation();
   await pendingBlocksNavigationAndCodeExplainsAttachments();
+  await nativeAttachmentReasonBlocksPickerAndFileStaging();
   await asynchronousCatalogLoadingAndRefresh();
   await nativeCodeAttachmentCapabilityAndDirectGesture();
   await replyContextWaitsAndSurvivesReload();

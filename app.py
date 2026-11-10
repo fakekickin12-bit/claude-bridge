@@ -1486,7 +1486,9 @@ class Window(QMainWindow):
             ready = client.action("check_ready", timeout=90)
             if (paths and ready.get("mode") == "Code"
                     and (ready.get("capabilities") or {}).get("native_attachments") is not True):
-                raise BridgeError("当前 Code 附件载入尚未就绪，请刷新后重试。")
+                reason = (ready.get("capabilities") or {}).get("attachment_reason")
+                reason = reason.strip()[:500] if isinstance(reason, str) else ""
+                raise BridgeError(reason or "当前 Code 客户端的附件入口不可用，请到 Ubuntu 查看附件输入区。")
             if paths:
                 bundle = build_bundle(paths, previews, self.cancel_transfer, self.transfer_progress.emit)
                 receipts.extend({"name": f["name"], "local_path": f["path"], "kind": f["kind"], "size": f["size"], "sha256": f["sha256"]} for f in bundle["originals"])
