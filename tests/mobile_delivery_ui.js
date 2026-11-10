@@ -51,6 +51,7 @@ class DeliveryService {
     this.translationCalls = 0;
     this.deferNextPost = false;
     this.postRelease = null;
+    this.target = {ready: true, mode: "Code", context: "a".repeat(64)};
   }
 
   job(id) {
@@ -63,8 +64,8 @@ class DeliveryService {
   async fetch(url, options) {
     if (url === "/api/state") return response({
       csrf: "synthetic-csrf", profiles: [{id: "synthetic", label: "Synthetic API", kind: "api", model: "synthetic"}],
-      default_profile: "synthetic", target: {ready: true, mode: "Code", context: "a".repeat(64)},
-      worker: {online: true, busy: false}, reply: {text: "", generating: false}, active_job: null
+      default_profile: "synthetic", target: clone(this.target),
+      worker: {online: true, busy: false}, reply: {text: "", generating: this.target.busy === true}, active_job: null
     });
     if (url === "/api/history") return response({jobs: []});
     if (url === "/api/jobs") {
@@ -127,6 +128,7 @@ function browser(service, storage = null) {
     click: id => elements.get(id).dispatch("click"),
     edit(id, value) { elements.get(id).value = value; elements.get(id).dispatch("input"); },
     poll: () => intervals.get(1000)?.(),
+    pollState: () => intervals.get(5000)?.(),
     visibility(hidden) {
       document.hidden = hidden;
       for (const callback of listeners.get("visibilitychange") || []) callback();
@@ -259,11 +261,81 @@ async function oldReceiptCannotClearANewerPendingJob() {
   assert.equal(service.posts.length, 2);
 }
 
+async function verifiedRunningComposerAllowsAppendButNotNew() {
+  const service = new DeliveryService();
+  service.target = {...service.target, ready: false, busy: true, send_ready: true,
+    send_mode: "running_insert", send_reason: "Claude 正在运行，可以追加文字。"};
+  const page = browser(service);
+  await settle(() => page.elements.get("profile-select").value === "synthetic", "Running composer native grant");
+  page.edit("english", "Append this to the current running task.");
+  assert.equal(page.elements.get("send-button").disabled, false);
+  assert.equal(page.elements.get("translate-send-button").disabled, false);
+  assert.equal(page.elements.get("new-button").disabled, true);
+  assert.equal(page.elements.get("target-state").textContent, "正在运行 · 可追加");
+  page.click("new-button");
+  assert.equal(service.posts.length, 0, "Send permission does not grant idle/new actions");
+  page.click("send-button");
+  await settle(() => service.posts.length === 1, "Explicit append submission");
+  assert.equal(service.posts[0].action, "send");
+  assert.equal(service.posts[0].english, "Append this to the current running task.");
+  assert.equal(page.elements.get("send-button").disabled, true, "Pending original request still blocks another submission");
+  assert.equal(service.translationCalls, 0);
+}
+
+async function blockedOrUnconfirmedRunningComposerNeverPosts() {
+  const cases = [
+    {send_ready: false}, {send_ready: "true"}, {}, {send_ready: true, awaiting_input: true},
+    {send_ready: true, approval: true}, {send_ready: true, locked: true},
+    {send_ready: true, draft_chars: 1}, {send_ready: true, window_visible: false}
+  ];
+  for (const change of cases) {
+    const service = new DeliveryService();
+    service.target = {...service.target, ready: false, busy: true, send_reason: "Native composer not available", ...change};
+    const page = browser(service);
+    await settle(() => page.elements.get("profile-select").value === "synthetic", "Blocked running composer");
+    page.edit("english", "Keep this draft without sending.");
+    assert.equal(page.elements.get("send-button").disabled, true);
+    assert.equal(page.elements.get("translate-send-button").disabled, true);
+    page.click("send-button"); page.click("translate-send-button");
+    assert.equal(service.posts.length, 0, "A blocked click cannot bypass native send readiness");
+    assert.equal(page.elements.get("english").value, "Keep this draft without sending.");
+  }
+}
+
+async function runningAttachmentsStayStagedUntilIdle() {
+  const service = new DeliveryService();
+  service.target = {...service.target, ready: false, busy: true, send_ready: true,
+    send_mode: "running_insert", capabilities: {native_attachments: true, running_attachments: false}};
+  const attachments = [{id: "d".repeat(32), name: "staged.png", size: 660000, kind: "image"}];
+  const source = "继续当前任务";
+  const storage = new Map([[storageKey, JSON.stringify({source, english: "Append with the staged image.",
+    boundSource: source, attachments, revision: 1})]]);
+  const page = browser(service, storage);
+  await settle(() => page.elements.get("profile-select").value === "synthetic", "Running staged attachment");
+  assert.equal(page.elements.get("send-button").disabled, true);
+  assert.equal(page.elements.get("translate-send-button").disabled, true);
+  assert.equal(page.elements.get("attach-button").disabled, false, "Local file staging remains available");
+  assert.match(page.elements.get("attachment-hint").textContent, /正在运行.*附件.*等任务空闲/);
+  page.click("send-button"); page.click("translate-send-button");
+  assert.match(page.elements.get("notice").textContent, /正在运行.*附件.*等任务空闲/);
+  assert.equal(service.posts.length, 0);
+  assert.deepEqual(page.draft().attachments, attachments);
+  service.target = {...service.target, ready: true, busy: false, send_mode: "idle"};
+  page.pollState();
+  await settle(() => page.elements.get("send-button").disabled === false, "Idle restores ordinary attachment delivery");
+  assert.equal(page.elements.get("translate-send-button").disabled, false);
+  assert.deepEqual(page.draft().attachments, attachments);
+  assert.equal(service.posts.length, 0, "Becoming idle never automatically submits a staged draft");
+}
+
 (async () => {
   await slowReceiptConfirmsWithoutAnotherPost();
   await editedDraftAndFailedTranslationRecovery();
   await reloadAndManualAcknowledgementRetainOriginalId();
   await oldReceiptCannotClearANewerPendingJob();
+  await verifiedRunningComposerAllowsAppendButNotNew();
+  await blockedOrUnconfirmedRunningComposerNeverPosts();
+  await runningAttachmentsStayStagedUntilIdle();
   console.log("Mobile delivery UI passed: unknown/failed English recovery, matching-draft resend guard, 110-second receipt confirmation, edit preservation, reload/visibility original-ID queries, and newer-job preservation without repeated translation or submission");
 })().catch(error => {
   console.error(error);

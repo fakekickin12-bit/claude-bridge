@@ -31,6 +31,7 @@ class Remote:
         self.receipt_state = "missing"
         self.window = None
         self.read_checks = False
+        self.running = False
 
     def client(self, target):
         target = dict(target)
@@ -41,12 +42,14 @@ class Remote:
             def action(self, action, **kwargs):
                 remote.calls.append((action, kwargs, target))
                 if action == "check_ready":
-                    return {"ready": True, "context": CONTEXT, "mode": "Code"}
+                    assert kwargs.get("for_send") is True, "Send preflight must use the additive-input intent"
+                    return {"ready": True, "context": CONTEXT, "mode": "Code", "busy": remote.running,
+                            "send_ready": True, "send_mode": "queue" if remote.running else "idle"}
                 if action == "send":
                     assert kwargs["timeout"] == 180
                     if remote.send_error:
                         raise remote.send_error
-                    return {"state": "submitted"}
+                    return {"state": "submitted" if kwargs["enter"] else "pasted"}
                 if action == "delivery_status":
                     assert set(kwargs) == {"request_id", "fingerprint", "timeout"}
                     assert kwargs["timeout"] == 25
@@ -87,11 +90,12 @@ def main():
     warnings = []
     with tempfile.TemporaryDirectory(prefix="bridge-desktop-delivery-") as directory:
         root = Path(directory)
-        for name in ("immediate", "late", "changed", "pasted", "pasted-auto", "history-error", "restart"):
+        for name in ("immediate", "late", "changed", "pasted", "pasted-auto", "history-error", "restart", "running", "running-pasted"):
             data = root / name
             config = core.defaults()
             config["ssh"]["host"] = "synthetic-host"
             config["auto_translate_reply"] = False
+            config["auto_enter"] = True
             core.atomic_json(data / "config.json", config)
             remote = Remote()
             with patch.object(desktop, "DATA_DIR", data), patch.object(core, "DATA_DIR", data), \
@@ -104,6 +108,25 @@ def main():
                 stop(window)
                 prepare(window)
                 before = (window.source.toPlainText(), window.english.toPlainText(), list(window.attachments))
+                if name in {"running", "running-pasted"}:
+                    remote.running = True
+                    remote.send_error = None
+                    window.accept_reply({"context": CONTEXT, "mode": "Code", "text": "Working on the current action.", "generating": True})
+                    assert window.reply_generating and window.send_button.isEnabled()
+                    if name == "running-pasted":
+                        window.enter.setChecked(False)
+                    window.send()
+                    assert remote.count("send") == 1
+                    assert window.history[0]["state"] == ("pasted" if name == "running-pasted" else "submitted")
+                    assert not window.pending_deliveries
+                    if name == "running-pasted":
+                        assert window.english.toPlainText() == before[1]
+                    else:
+                        assert not window.source.toPlainText() and not window.english.toPlainText()
+                    stop(window)
+                    window.close()
+                    qt.processEvents()
+                    continue
                 if name == "immediate":
                     remote.receipt_state = "submitted"
                 if name == "pasted":

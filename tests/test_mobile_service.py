@@ -597,6 +597,102 @@ def test_finished_generation_rechecks_readiness_without_guessing(backend):
     assert backend.remote.count("probe") == 2 and backend.service.target["ready"] is True
 
 
+def test_running_text_send_uses_native_send_intent_but_new_keeps_idle_rules(backend, monkeypatch):
+    original = backend.remote.action
+    def running(action, **kwargs):
+        if action == "check_ready":
+            if kwargs.get("for_send") is not True:
+                raise core.BridgeError("Synthetic active task forbids new conversations")
+        result = original(action, **kwargs)
+        if action == "probe":
+            return {**result, "ready": False, "busy": True, "draft": "", "send_ready": True,
+                    "send_mode": "running_insert", "send_reason": "Claude 正在运行，可以追加文字。"}
+        return result
+    monkeypatch.setattr(backend.remote, "action", running)
+    backend.remote.mode = "Code"
+    backend.remote.reply.update(mode="Code", generating=True)
+    backend.service.capture()
+    assert backend.service.target["send_ready"] is True and backend.service.target["ready"] is False
+    assert backend.service.target["send_mode"] == "running_insert"
+    for action in ("send", "translate_send"):
+        result = run(backend, request(action, english="Append this instruction.", expected_context=CONTEXT))
+        assert result["state"] == "submitted"
+    checks = [values for name, values in backend.remote.calls if name == "check_ready"]
+    assert len(checks) == 2 and all(values.get("for_send") is True for values in checks)
+    result = run(backend, request("new", expected_context=CONTEXT))
+    assert result["state"] == "failed" and backend.remote.count("new") == 0
+    assert backend.remote.count("send") == 2
+
+
+def test_running_attachments_wait_before_translation_or_upload_and_keep_staged_file(backend, monkeypatch):
+    original = backend.remote.action
+    def running(action, **kwargs):
+        value = original(action, **kwargs)
+        if action == "check_ready":
+            assert kwargs.get("for_send") is True
+            return {**value, "busy": True, "allow_running": True, "send_ready": True,
+                    "capabilities": {"native_attachments": True, "running_attachments": False}}
+        return value
+    monkeypatch.setattr(backend.remote, "action", running)
+    backend.remote.mode = "Code"
+    staged = backend.service.directory / "uploads" / ("d" * 32)
+    staged.mkdir(parents=True)
+    source = staged / "synthetic.png"
+    source.write_bytes(b"Synthetic staged image")
+    result = run(backend, request("translate_send", expected_context=CONTEXT, attachment_ids=["d" * 32]))
+    assert result["state"] == "failed" and result["error"] == mobile.RUNNING_ATTACHMENT_REASON
+    assert backend.translator.translations == [] and backend.remote.count("send") == 0
+    assert backend.remote.count("attachment_prepare") == 0 and source.read_bytes() == b"Synthetic staged image"
+
+
+def test_generating_capture_preserves_confirmed_send_readiness_only_in_same_context(backend, monkeypatch):
+    original = backend.remote.action
+    context_checks = []
+    def probe(action, **kwargs):
+        if action == "probe":
+            context_checks.append((backend.service.target.get("context"), backend.service.target.get("send_ready")))
+        result = original(action, **kwargs)
+        if action == "probe":
+            return {**result, "ready": False, "busy": True, "draft": "", "send_ready": True,
+                    "send_mode": "running_insert", "send_reason": "Native running text entry verified"}
+        return result
+    monkeypatch.setattr(backend.remote, "action", probe)
+    backend.remote.reply["generating"] = True
+    backend.service.capture()
+    assert context_checks == [(CONTEXT, False)] and backend.service.target["send_ready"] is True
+    before = backend.remote.count("probe")
+    backend.service.capture()
+    assert backend.service.target["send_ready"] is True and backend.remote.count("probe") == before
+    backend.remote.context = "b" * 64
+    backend.service.capture()
+    assert context_checks[-1] == ("b" * 64, False)
+    assert backend.service.target["context"] == "b" * 64 and backend.service.target["send_ready"] is True
+    backend.remote.reply.update(awaiting_input=True, question={})
+    backend.service.capture()
+    assert backend.service.target["send_ready"] is False and backend.service.target["awaiting_input"] is True
+    assert "请到 Ubuntu" in backend.service.target["send_reason"]
+    assert backend.service.target["send_mode"] == "unavailable"
+    backend.service.capture_failed("Synthetic capture unavailable")
+    assert backend.service.target["send_ready"] is False
+    assert backend.service.target["send_reason"] == "Synthetic capture unavailable"
+
+
+def test_native_send_metadata_is_strict_bounded_and_does_not_grant_idle_actions():
+    state = mobile.MobileBridge.safe_target({"ready": False, "send_ready": True, "busy": True,
+        "draft": "", "send_mode": "running_insert", "send_reason": "r" * 900,
+        "private_send_field": "never expose"})
+    assert state["ready"] is False and state["send_ready"] is True and state["send_mode"] == "running_insert"
+    assert len(state["send_reason"]) == 500 and "private_send_field" not in state
+    assert mobile.MobileBridge.safe_target({"ready": False, "send_ready": "true"})["send_ready"] is False
+    assert "send_ready" not in mobile.MobileBridge.safe_target({"ready": True})
+    capabilities = mobile.MobileBridge.safe_target({"capabilities": {"native_attachments": True,
+        "running_attachments": False}})["capabilities"]
+    assert capabilities == {"native_attachments": True, "running_attachments": False}
+    for block in ({"awaiting_input": True}, {"approval": True}, {"locked": True}, {"draft": "Owned draft"},
+                  {"attachments": ["owned.png"]}, {"window_visible": False}):
+        assert mobile.MobileBridge.safe_target({"ready": False, "send_ready": True, **block})["send_ready"] is False
+
+
 def test_old_job_payload_without_new_session_signature_keeps_original_idempotency(backend):
     payload = request()
     old = payload.model_dump()

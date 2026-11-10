@@ -496,18 +496,32 @@
     ui.connection.replaceChildren(dot, document.createTextNode(label));
   }
 
+  function targetCanSend(target = serverState?.target) {
+    if (!target || target.awaiting_input === true || target.approval === true || target.locked === true ||
+        target.window_visible === false || Number(target.draft_chars || 0) > 0) return false;
+    return target.send_ready === true || (target.send_ready === undefined && target.ready === true);
+  }
+
+  const runningAttachmentReason = "Claude 正在运行，可追加文字；附件请在 Ubuntu 添加或等任务空闲后发送。";
+  function runningAttachmentBlocked(target = serverState?.target) {
+    return target?.mode === "Code" && target.busy === true && attachmentItems.length > 0 &&
+      target.capabilities?.running_attachments !== true;
+  }
+
   function renderTarget() {
     const target = serverState.target || {};
     const worker = serverState.worker || {};
     const online = Boolean(worker.online);
     const ready = online && target.ready;
+    const sendReady = online && targetCanSend(target);
     renderConnection(online, online ? "已连接" : "电脑离线");
     const mode = target.mode === "Code" ? "Claude Code" : target.mode === "Chat" ? "Claude Chat" : "Claude";
-    ui.targetState.textContent = !online ? "电脑离线" : ready ? "可以发送" : target.awaiting_input === true ? "等待你选择" : target.busy ? "正在执行任务" : "等待就绪";
-    ui.targetState.className = `status-pill ${ready ? "ready" : "blocked"}`;
+    ui.targetState.textContent = !online ? "电脑离线" : target.awaiting_input === true ? "等待你选择" :
+      sendReady && target.busy ? "正在运行 · 可追加" : sendReady ? "可以发送" : target.busy ? "正在执行任务" : "等待就绪";
+    ui.targetState.className = `status-pill ${sendReady ? "ready" : "blocked"}`;
     ui.targetTitle.textContent = target.title ? `${mode} · ${target.project_title ? `${target.project_title} / ` : ""}${target.title}` : mode;
-    const detail = !online ? "请确认 Windows 桥接服务正在运行" : ready ? target.workspace || "沿用 Ubuntu 当前打开的会话" :
-      target.reason || "请在 Ubuntu 打开目标会话";
+    const detail = !online ? "请确认 Windows 桥接服务正在运行" : sendReady && target.busy ? target.send_reason || "可向当前任务追加消息，不会点击停止。" :
+      ready && sendReady ? target.workspace || "沿用 Ubuntu 当前打开的会话" : target.send_reason || target.reason || "请在 Ubuntu 打开目标会话";
     ui.targetDetail.textContent = detail;
     ui.attachmentHint.hidden = target.mode !== "Code";
     if (target.mode === "Code") ui.attachmentHint.textContent = supportsAttachments() ?
@@ -694,15 +708,18 @@
     const online = Boolean(serverState?.worker?.online);
     const localBusy = Boolean(pendingJob || posting || uploadCount);
     const ready = authenticated && connected && online && target.ready && !localBusy;
+    const sendReady = authenticated && connected && online && targetCanSend(target) && !runningAttachmentBlocked(target) && !localBusy;
     const profileReady = Boolean(selectedProfile);
     const uncertainDraft = uncertainDraftMatches();
     ui.translate.disabled = !authenticated || !connected || !online || !profileReady || localBusy || !ui.source.value.trim();
-    ui.send.disabled = !ready || !profileReady || !ui.english.value.trim() || boundSource !== ui.source.value || Boolean(uncertainDraft);
-    ui.translateSend.disabled = !ready || !profileReady || !ui.source.value.trim() || Boolean(uncertainDraft);
+    ui.send.disabled = !sendReady || !profileReady || !ui.english.value.trim() || boundSource !== ui.source.value || Boolean(uncertainDraft);
+    ui.translateSend.disabled = !sendReady || !profileReady || !ui.source.value.trim() || Boolean(uncertainDraft);
     ui.newButton.disabled = !ready;
     if (ui.copyEnglish) ui.copyEnglish.disabled = copyingEnglish || !ui.english.value.trim();
     ui.attach.disabled = !authenticated || !connected || !online || Boolean(pendingJob || posting);
     ui.attach.title = supportsAttachments() ? "载入附件" : "查看 Code 会话的附件支持说明";
+    if (target.mode === "Code") ui.attachmentHint.textContent = runningAttachmentBlocked(target) ? runningAttachmentReason :
+      supportsAttachments() ? "附件会随指令载入当前 Code 会话。" : "当前 Code 会话尚未开放附件载入，可点击回形针查看说明。";
     ui.profile.disabled = Boolean(pendingJob || posting);
     ui.autoEnter.disabled = Boolean(pendingJob || posting);
     ui.replyToggle.setAttribute("aria-pressed", String(replyTranslated));
@@ -756,8 +773,12 @@
       showNotice("中文已修改，请重新翻译或编辑英文稿后再发送。", true);
       return;
     }
-    if ((sends || action === "new") && !serverState?.target?.ready) {
-      showNotice(serverState?.target?.reason || "请先在 Ubuntu 打开可接收指令的会话。", true);
+    if ((sends && !targetCanSend()) || (action === "new" && !serverState?.target?.ready)) {
+      showNotice((sends ? serverState?.target?.send_reason : "") || serverState?.target?.reason || "请先在 Ubuntu 打开可接收指令的会话。", true);
+      return;
+    }
+    if (sends && runningAttachmentBlocked()) {
+      showNotice(runningAttachmentReason, true);
       return;
     }
     const snapshot = composeSnapshot();

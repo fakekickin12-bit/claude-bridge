@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.14.2"
+VERSION = "1.15.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -350,7 +350,7 @@ def visible_menus():
     return result
 
 
-def focus_composer(expected_context=None, expected_draft=""):
+def focus_composer(expected_context=None, expected_draft="", *, allow_running=False):
     """Focus the actual visible input, including dismissing a native menu grab."""
     from Xlib import X, display
     from Xlib.ext import xtest
@@ -396,7 +396,9 @@ def focus_composer(expected_context=None, expected_draft=""):
             if current["context"] != expected_context:
                 raise DesktopError("聚焦后发现客户端已切换对话。尚未提交消息，请检查目标对话。")
             if (current["draft"] != expected_draft or current["dialogs"]
-                    or current["busy"] or current["approval"] or current.get("awaiting_input", False)):
+                    or current["busy"] and not allow_running
+                    or current["approval"] or current.get("awaiting_input", False)
+                    or current.get("locked", False)):
                 raise DesktopError("聚焦时客户端已有草稿、弹窗或任务。已停止输入。")
         time.sleep(.15)
         return wid
@@ -634,9 +636,10 @@ def match_native_attachments(names, paths, partial=False):
     return matches
 
 
-def require_attachment_draft(state, context, paths, draft, partial=False):
+def require_attachment_draft(state, context, paths, draft, partial=False, *, allow_running=False):
     if (state["context"] != context or state["draft"] != draft or state["dialogs"]
-            or state["busy"] or state["approval"] or state.get("awaiting_input", False) or state.get("locked", False)
+            or state["busy"] and not (allow_running and not paths)
+            or state["approval"] or state.get("awaiting_input", False) or state.get("locked", False)
             or not state.get("window_visible", True)):
         raise DesktopError("客户端对话、草稿或任务状态已经改变，已停止附件操作。")
     if not partial and state.get("attachment_pending"):
@@ -1698,8 +1701,13 @@ def status():
     except DesktopError as exc:
         visible = False
         window_error = str(exc)
-    input_ready = bool(session_ready and enabled and not draft and not attachments and not attachment_pending and not question
-                       and not busy and not dialogs and not approval and not locked)
+    running_input = bool(is_code and CODE_LOCAL_SESSION.fullmatch(route) and enabled
+                         and entry.getRoleName() == "entry" and entry.name == "Prompt"
+                         and {"tiptap", "ProseMirror"}.issubset(node_classes(entry)) and showing(entry))
+    common_ready = bool(session_ready and enabled and not draft and not attachments and not attachment_pending
+                        and not question and not dialogs and not approval and not locked)
+    input_ready = common_ready and not busy
+    send_input_ready = common_ready and (not busy or running_input)
     reason = "可以接收指令" if input_ready and visible else (
         "Ubuntu 桌面已锁定，请先解锁" if locked else
         QUESTION_WAIT_REASON if question is not None else
@@ -1707,6 +1715,10 @@ def status():
         "Claude Code 要求重新登录。请在 Ubuntu 点 Sign in again 完成验证。" if is_code and "Sign in again" in names else
         "Claude Code 正在等待你处理提问或权限请求" if approval else
         "请查看客户端当前草稿、任务或弹窗" if not input_ready else window_error)
+    send_ready = bool(send_input_ready and visible)
+    send_reason = ("可以追加消息；当前任务会继续运行。" if send_ready and busy else
+                   "可以接收指令" if send_ready else
+                   "当前客户端运行时追加消息入口尚未就绪，请到 Ubuntu 查看。" if busy and not running_input else reason)
     return {"context": context, "title": attrs.get("Title", "Claude"), "mode": mode, "draft": draft,
             "process_id": process_id, "new_session": new_session,
             "setup_visible": setup_visible,
@@ -1718,17 +1730,25 @@ def status():
             "approval": approval,
             "awaiting_input": question is not None, "question": question,
             "input_ready": input_ready, "window_visible": visible, "window_error": window_error,
-            "capabilities": native_attachment_capabilities(process_id, is_code, entry, controls, visible),
+            "send_ready": send_ready, "send_input_ready": bool(send_input_ready), "send_reason": send_reason,
+            "send_mode": "running_insert" if send_ready and busy else "idle" if send_ready else "unavailable",
+            "running_input_capable": running_input,
+            "capabilities": {**native_attachment_capabilities(process_id, is_code, entry, controls, visible),
+                             "running_attachments": False},
             "ready": input_ready and visible, "reason": reason,
             "model": next((n[7:] for n in names if n.startswith("Model: ")), "客户端当前设置")}
 
 
 def check_ready(request):
     state = status()
+    for_send = request.get("for_send") is True
+    def eligible(value):
+        return (value.get("send_input_ready", value.get("send_ready", value.get("input_ready", value["ready"])))
+                if for_send else value.get("input_ready", value["ready"]))
     if request.get("context") and request["context"] != state["context"]:
         raise DesktopError("Ubuntu 已切换对话或重启客户端，已停止发送。请重新检查目标。")
-    if not state.get("input_ready", state["ready"]):
-        raise DesktopError("Claude 客户端尚未就绪：" + state.get("reason", "请保留或处理现有草稿/附件，关闭弹窗，或等待当前回复完成。"))
+    if not eligible(state):
+        raise DesktopError("Claude 客户端尚未就绪：" + state.get("send_reason" if for_send else "reason", "请保留或处理现有草稿/附件，关闭弹窗，或等待当前回复完成。"))
     try:
         window_id()
     except WindowUnavailable:
@@ -1737,11 +1757,14 @@ def check_ready(request):
         state = status()
         if state["context"] != original_context:
             raise DesktopError("客户端恢复后对话发生变化，尚未发送。请检查 Ubuntu 的目标对话后再发送。")
-        if not state["ready"]:
+        if not eligible(state):
             raise DesktopError("客户端窗口已恢复，但尚未就绪：" + state["reason"])
     return {"ready": True, "context": state["context"], "title": state["title"],
             "mode": state.get("mode", "Chat"),
             "capabilities": state.get("capabilities", {"native_attachments": False}),
+            "busy": bool(state.get("busy")), "send_ready": True if for_send else bool(state.get("send_ready", state["ready"])),
+            "send_reason": state.get("send_reason", state.get("reason", "")), "send_mode": state.get("send_mode", "idle"),
+            "allow_running": bool(for_send and state.get("running_input_capable")),
             **{key: state.get(key) for key in ("process_id", "new_session", "workspace", "session_id")}}
 
 
@@ -1784,7 +1807,189 @@ def code_submission_confirmed(initial, current, value):
     return True
 
 
-def paste(value, expected_context=None):
+def running_user_snapshot(page, *, read_text=False):
+    """Read only the latest native human message, never the older body history."""
+    feeds = [node for node, role, attrs in reply_metadata_nodes(page, reverse=True, prune_feeds=True)
+             if message_feed(node, role, attrs)]
+    if len(feeds) != 1:
+        raise DesktopError("追加消息的当前消息列表尚未就绪，请到 Ubuntu 查看；不会自动重发。")
+    feed, selected = feeds[0], None
+    try:
+        from gi.repository import Atspi
+        atspi, collection = initialize(), feed.queryCollection()
+        rule = collection.createMatchRule(
+            Atspi.StateSet.new([]), Atspi.CollectionMatchType.ALL, [], Atspi.CollectionMatchType.ALL,
+            [int(atspi.ROLE_ARTICLE)], Atspi.CollectionMatchType.ANY,
+            [], Atspi.CollectionMatchType.ALL, False)
+        for article in collection.getMatches(rule, Atspi.CollectionSortOrder.REVERSE_CANONICAL, 32, True):
+            if turn_article_speaker(article)[0] == "user":
+                selected = article
+                break
+    except Exception:
+        pass
+    if selected is None:
+        for node, role, attrs in reply_metadata_nodes(feed, reverse=True, limit=768, turn_boundaries=True):
+            classes = attrs.get("class", "").split()
+            if ("group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes
+                    or role == "article" and turn_article_speaker(node)[0] == "user"):
+                selected = node
+                break
+    if selected is None:
+        raise DesktopError("尚未确认追加消息的原始用户消息标记，请到 Ubuntu 查看；不会自动重发。")
+    result = {"feed_id": accessible_key(feed), "message_id": accessible_key(selected)}
+    if not read_text:
+        return result
+    selected_classes = node_classes(selected)
+    if "group/bubble" in selected_classes or "bg-[var(--cds-bg-user-message)]" in selected_classes:
+        bubble = selected
+    else:
+        bubbles, budget = [], [96]
+        def find_bubbles(node, depth=0):
+            budget[0] -= 1
+            if budget[0] < 0 or depth > 10:
+                raise ReplyReadLimit("追加消息的正文结构尚未确认。")
+            role, attrs = node.getRoleName(), node_attributes(node)
+            classes = attrs.get("class", "").split()
+            if "group/bubble" in classes or "bg-[var(--cds-bg-user-message)]" in classes:
+                bubbles.append(node)
+                return
+            if role in REPLY_BODY_ROLES or role in {"push button", "entry", "tool bar"} or "sr-only" in classes:
+                return
+            for index in range(node.childCount):
+                find_bubbles(node.getChildAtIndex(index), depth + 1)
+        find_bubbles(selected)
+        if len(bubbles) != 1:
+            raise DesktopError("追加消息的正文归属尚未确认，请到 Ubuntu 查看；不会自动重发。")
+        bubble = bubbles[0]
+    remaining, deadline = [2000], time.monotonic() + 4
+    def read(node, depth=0):
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 48 or time.monotonic() > deadline:
+            raise ReplyReadLimit("追加消息的正文读取尚未完成。")
+        role, attrs = node.getRoleName(), node_attributes(node)
+        classes, tag = attrs.get("class", "").split(), attrs.get("tag", "")
+        if "sr-only" in classes or role in {"tool bar", "status bar", "push button", "toggle button", "entry", "menu", "menu item"}:
+            return ""
+        if tag == "br":
+            return "\n"
+        count = node.childCount
+        if count > remaining[0]:
+            raise ReplyReadLimit("追加消息的正文读取尚未完成。")
+        if count:
+            body = "".join(read(node.getChildAtIndex(index), depth + 1) for index in range(count))
+        else:
+            body = node.name if role in {"static", "text", "link"} else ""
+            if role == "static" and body in {"Message collapsed", "Message expanded"}:
+                return ""
+        if role == "paragraph" or tag in {"p", "pre", "blockquote", "li"}:
+            return body + "\n"
+        return body
+    result["text"] = read(bubble).strip()
+    return result
+
+
+def normalized_message_hash(value):
+    return hashlib.sha256(" ".join(value.split()).encode("utf-8")).hexdigest()
+
+
+def running_submission_confirmed(initial, current, expected_hash, baseline):
+    """A pre-existing busy state or empty composer is never proof of acceptance."""
+    if (current.get("context") != initial["context"] or current.get("mode") != "Code"
+            or current.get("process_id") != initial.get("process_id")):
+        raise DesktopError("追加消息后客户端会话已经变化，结果未确认，请到 Ubuntu 查看。")
+    if (current.get("draft") or current.get("attachments") or current.get("locked", False)
+            or not current.get("window_visible", True)):
+        return False
+    application = app()
+    page, attrs = document(application)
+    if page_context(application, page, attrs) != initial["context"]:
+        raise DesktopError("核对追加消息时客户端已切换会话，结果未确认。")
+    after = running_user_snapshot(code_panel(page), read_text=True)
+    if (after["feed_id"] != baseline["feed_id"] or after["message_id"] == baseline["message_id"]
+            or normalized_message_hash(after["text"]) != expected_hash):
+        return False
+    return {"kind": "new_user_message", "message_id_hash": hashlib.sha256(after["message_id"].encode()).hexdigest()}
+
+
+def running_enter_ready(initial, value):
+    """Ordinary Return is allowed only in the exact focused running Prompt."""
+    if initial.get("allow_running") is not True or initial.get("mode") != "Code" or initial.get("new_session"):
+        raise DesktopError("当前会话不支持运行时追加消息，已保留草稿。")
+    # Full status/approval checks may take seconds. Perform them BEFORE the
+    # final focused Prompt read, so a user moving focus during that scan cannot
+    # leave Return targeting another control in the same Claude window.
+    current = status()
+    require_attachment_draft(current, initial["context"], [], value.strip(), allow_running=True)
+    if current.get("process_id") != initial.get("process_id"):
+        raise DesktopError("追加消息的客户端已经变化，已保留草稿。")
+    wid = window_id()
+    application = app()
+    page, attrs = document(application)
+    if page_context(application, page, attrs) != initial["context"]:
+        raise DesktopError("追加消息目标已经变化，已保留草稿。")
+    entry, atspi = composer(page, attrs), initialize()
+    if visible_menus():
+        raise DesktopError("Ubuntu 当前有原生菜单打开，已保留追加消息草稿。")
+    state = entry.getState()
+    if (entry.getRoleName() != "entry" or entry.name != "Prompt"
+            or not {"tiptap", "ProseMirror"}.issubset(node_classes(entry)) or not showing(entry)
+            or not all(state.contains(flag) for flag in (atspi.STATE_FOCUSED, atspi.STATE_ENABLED, atspi.STATE_EDITABLE))
+            or text(entry).strip() != value.strip()):
+        raise DesktopError("追加消息输入框未保持精确焦点或草稿已变化，请到 Ubuntu 查看。")
+    from Xlib import X, display
+    connection = display.Display(environment()["DISPLAY"])
+    try:
+        root = connection.screen().root
+        active = root.get_full_property(connection.intern_atom("_NET_ACTIVE_WINDOW"), X.AnyPropertyType)
+        held = X.ShiftMask | X.ControlMask | X.Mod1Mask | X.Mod4Mask | X.Mod5Mask | X.Button1Mask | X.Button2Mask | X.Button3Mask
+        if active is None or len(active.value) != 1 or int(active.value[0]) != wid or root.query_pointer().mask & held:
+            raise DesktopError("Ubuntu 焦点或按键状态已经变化，已保留追加消息草稿。")
+    finally:
+        connection.close()
+
+
+def reconcile_running_delivery(ledger, record):
+    """Only new running receipts may observe a later native acceptance; no input."""
+    pending = record.get("running_submission")
+    valid_path = lambda value: isinstance(value, str) and bool(re.fullmatch(r"/org/a11y/atspi/accessible/[A-Za-z0-9_/-]+", value))
+    if (record.get("state") != "submitting" or record.get("auto_enter") is not True
+            or not isinstance(pending, dict) or type(pending.get("schema")) is not int or pending["schema"] != 1
+            or not isinstance(record.get("context"), str) or not re.fullmatch(r"[a-f0-9]{64}", record["context"])
+            or not isinstance(pending.get("process_id"), int) or isinstance(pending["process_id"], bool) or pending["process_id"] <= 0
+            or not all(valid_path(pending.get(key)) for key in ("feed_id", "message_id"))
+            or not isinstance(pending.get("expected_text_sha256"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", pending["expected_text_sha256"])):
+        return record
+    try:
+        descriptor = os.open(ROOT / "desktop.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "a+b") as lock:
+            info = os.fstat(lock.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return record
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return record
+            fresh = json.loads(ledger.read_text(encoding="utf-8"))
+            if (fresh.get("request_id") != record.get("request_id") or fresh.get("fingerprint") != record.get("fingerprint")
+                    or fresh.get("context") != record.get("context") or fresh.get("auto_enter") is not True
+                    or fresh.get("running_submission") != pending or fresh.get("state") != "submitting"):
+                return record
+            initial = {"context": record["context"], "mode": "Code", "process_id": pending["process_id"]}
+            proof = running_submission_confirmed(initial, status(), pending["expected_text_sha256"], pending)
+            if proof:
+                import remote
+                fresh.update(state="submitted", submission_evidence=proof, reconciled_at=time.time())
+                remote.atomic(ledger, fresh)
+                return fresh
+    except Exception:
+        # A lock, changed session, disappearing AX node, or unreadable body is
+        # unknown, never a reason to repeat the original submit action.
+        pass
+    return record
+
+
+def paste(value, expected_context=None, *, allow_running=False):
     clipboard = str(TOOLS / "usr/bin/xclip")
     def read():
         try:
@@ -1798,7 +2003,10 @@ def paste(value, expected_context=None):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=True)
     previous = read()
     data = value.encode("utf-8")
-    focus_composer(expected_context)
+    if allow_running:
+        focus_composer(expected_context, allow_running=True)
+    else:
+        focus_composer(expected_context)
     write(data)
     try:
         for _ in range(10):
@@ -1896,26 +2104,33 @@ def attachment_paths(request):
 
 
 def load_native_attachment_draft(value, paths, initial):
+    allow_running = initial.get("allow_running") is True and not paths
+    def require(current, draft, partial=False):
+        return require_attachment_draft(current, initial["context"], paths, draft, partial,
+                                        allow_running=allow_running)
     if paths:
         drop_files(paths, initial["context"])
         for _ in range(200):
             current = status()
-            matched = require_attachment_draft(current, initial["context"], paths, "", partial=True)
+            matched = require(current, "", partial=True)
             if len(matched) == len(paths) and not current.get("attachment_pending"):
                 break
             time.sleep(.15)
         else:
             raise DesktopError("客户端附件载入未完整确认，已保留草稿，不会提交。")
         time.sleep(.8)
-    require_attachment_draft(status(), initial["context"], paths, "")
-    paste(value, initial["context"])
+    require(status(), "")
+    if allow_running:
+        paste(value, initial["context"], allow_running=True)
+    else:
+        paste(value, initial["context"])
     current = status()
-    require_attachment_draft(current, initial["context"], paths, value.strip())
+    require(current, value.strip())
     return current
 
 
 def delivery_status(request):
-    """Read an owned delivery receipt without touching the client or resending."""
+    """Read a receipt; only new running witnesses may reconcile via read-only AX."""
     rid = request.get("request_id")
     fingerprint = request.get("fingerprint")
     if not isinstance(rid, str) or not re.fullmatch(r"[0-9a-f]{32}", rid):
@@ -1938,6 +2153,7 @@ def delivery_status(request):
             or not re.fullmatch(r"[0-9a-f]{64}", record["fingerprint"])
             or not hmac.compare_digest(record["fingerprint"], fingerprint)):
         return missing
+    record = reconcile_running_delivery(ledger, record)
     state = record.get("state")
     if not isinstance(state, str) or state not in {"preparing", "pasted", "submitting", "submitted", "cleared"}:
         state = "unknown"
@@ -2022,6 +2238,59 @@ def cleanup_attachment_draft(request):
         raise DesktopError("本次文字草稿的清理结果未确认，请查看 Ubuntu。")
 
 
+def prepare_message_submission(initial, current, record, value, paths):
+    """Read-only pre-submit checks; no Send/Return has been attempted here."""
+    allow_running = initial.get("allow_running") is True
+    running_delivery = bool(initial.get("busy") or current.get("busy"))
+    if running_delivery and (not allow_running or paths):
+        error = DesktopError("当前运行时仅支持文字追加，已保留客户端草稿；原任务会继续运行。")
+        error.not_submitted = True
+        raise error
+    atspi = initialize()
+    page, attrs = document()
+    is_code = initial.get("mode") == "Code"
+    root = code_dock(composer(page, attrs)) if is_code else page
+    labels = ({"Send", "Send message", "Send prompt", "Queue", "Queue message", "Queue prompt", "Add to queue"}
+              if is_code else {"Send message"})
+    for _ in range(20 if running_delivery else 200):
+        pump_events()
+        candidates = [n for n in buttons(root) if n.name in labels and showing(n)]
+        if len(candidates) > 1:
+            raise DesktopError("检测到多个发送按钮，已保留客户端草稿。")
+        send_button = candidates[0] if candidates else None
+        state = send_button.getState() if send_button is not None else None
+        if state is not None and state.contains(atspi.STATE_ENABLED) and state.contains(atspi.STATE_SENSITIVE):
+            break
+        time.sleep(.15)
+    else:
+        if not running_delivery:
+            raise DesktopError("附件尚未就绪或发送按钮不可用，已保留客户端草稿。")
+        send_button = None
+    current = status()
+    require_attachment_draft(current, initial["context"], paths, value.strip(), allow_running=allow_running)
+    running_delivery = running_delivery or bool(current.get("busy"))
+    if (current["context"] != initial["context"] or current["draft"] != value.strip()
+            or current["dialogs"] or current["approval"] or current.get("awaiting_input", False)
+            or current["busy"] and not allow_running
+            or send_button is not None and not showing(send_button)):
+        raise DesktopError("提交前客户端内容已改变，已停止发送。")
+    baseline = None
+    if running_delivery:
+        if not allow_running or paths:
+            raise DesktopError("当前运行时仅支持文字追加，已保留客户端草稿。")
+        application = app()
+        current_page, current_attrs = document(application)
+        if page_context(application, current_page, current_attrs) != initial["context"]:
+            raise DesktopError("追加消息目标已经变化，已保留草稿。")
+        baseline = running_user_snapshot(code_panel(current_page))
+        record["running_submission"] = {"schema": 1, "process_id": initial["process_id"],
+            **baseline, "expected_text_sha256": normalized_message_hash(value)}
+        record["delivery_mode"] = "running_insert"
+        if send_button is None:
+            running_enter_ready(initial, value)
+    return send_button, running_delivery, baseline
+
+
 def send(request):
     import remote
     value = request.get("text", "")
@@ -2040,14 +2309,26 @@ def send(request):
             if saved["fingerprint"] == fingerprint and saved["state"] in {"submitted", "pasted"}:
                 return {**saved, "repeated": True}
             raise DesktopError("上次操作结果未确认或发送 ID 已使用，请先查看 Ubuntu，不会自动重发。")
-        initial = check_ready(request)
+        try:
+            initial = check_ready({**request, "for_send": True})
+        except DesktopError as exc:
+            exc.not_submitted = True
+            raise
+        if initial.get("busy") and request.get("attachment_batch"):
+            error = DesktopError("Claude 正在运行时请先追加文字；附件请等当前任务完成后再载入。")
+            error.not_submitted = True
+            raise error
         if (initial.get("mode") == "Code" and request.get("attachment_batch")
                 and not initial.get("capabilities", {}).get("native_attachments", False)):
             error = DesktopError(initial.get("capabilities", {}).get("attachment_reason")
                                  or "当前 Code 附件传输不可用，请到 Ubuntu 查看；尚未载入或提交。")
             error.not_submitted = True
             raise error
-        paths = attachment_paths(request)
+        try:
+            paths = attachment_paths(request)
+        except DesktopError as exc:
+            exc.not_submitted = True
+            raise
         record = {"request_id": rid, "fingerprint": fingerprint, "state": "preparing", "time": time.time(),
                   "context": initial["context"], "auto_enter": bool(request.get("enter", True)),
                   "attachment_paths": paths}
@@ -2062,32 +2343,19 @@ def send(request):
                       native_labels=current["attachments"], draft_sha256=hashlib.sha256(value.strip().encode()).hexdigest())
         remote.atomic(ledger, record)
         if request.get("enter", True):
-            atspi = initialize()
-            page, attrs = document()
             is_code = initial.get("mode") == "Code"
-            root = code_dock(composer(page, attrs)) if is_code else page
-            labels = {"Send", "Send message", "Send prompt"} if is_code else {"Send message"}
-            for _ in range(200):
-                pump_events()
-                candidates = [n for n in buttons(root) if n.name in labels and showing(n)]
-                if len(candidates) > 1:
-                    raise DesktopError("检测到多个发送按钮，已保留客户端草稿。")
-                send_button = candidates[0] if candidates else None
-                state = send_button.getState() if send_button is not None else None
-                if state is not None and state.contains(atspi.STATE_ENABLED) and state.contains(atspi.STATE_SENSITIVE):
-                    break
-                time.sleep(.15)
-            else:
-                raise DesktopError("附件尚未就绪或发送按钮不可用，已保留客户端草稿。")
-            current = status()
-            require_attachment_draft(current, initial["context"], paths, value.strip())
-            if (current["context"] != initial["context"] or current["draft"] != value.strip()
-                    or current["dialogs"] or current["approval"] or current.get("awaiting_input", False)
-                    or current["busy"] or not showing(send_button)):
-                raise DesktopError("提交前客户端内容已改变，已停止发送。")
+            try:
+                send_button, running_delivery, baseline = prepare_message_submission(initial, current, record, value, paths)
+            except DesktopError as exc:
+                exc.not_submitted = True
+                raise
             record["state"] = "submitting"
             remote.atomic(ledger, record)
-            if not send_button.queryAction().doAction(0):
+            if send_button is None:
+                # One ordinary Return follows the native running-Prompt contract.
+                # Never send Stop, Ctrl+Enter, or another Return after an unknown.
+                xcommand("key", "Return")
+            elif not send_button.queryAction().doAction(0):
                 raise DesktopError("客户端未接受发送操作，请查看 Ubuntu。")
             deadline = time.monotonic() + (45 if initial.get("new_session") else 20)
             created_context = None
@@ -2103,10 +2371,13 @@ def send(request):
                     if created_context is not None and current["context"] != created_context:
                         raise DesktopError("首条消息提交后又切换了会话，结果未确认，请查看 Ubuntu。")
                     created_context = current["context"]
-                confirmed = (code_submission_confirmed(initial, current, value) if is_code else
+                confirmed = (running_submission_confirmed(initial, current, record["running_submission"]["expected_text_sha256"], baseline)
+                             if running_delivery else code_submission_confirmed(initial, current, value) if is_code else
                              not current["draft"] and not current["attachments"])
                 if confirmed:
                     record["state"] = "submitted"
+                    if running_delivery:
+                        record["submission_evidence"] = confirmed
                     if initial.get("new_session"):
                         record.update(initial_context=initial["context"], context=current["context"],
                                       session_id=current["session_id"], workspace=initial["workspace"])
@@ -2233,7 +2504,7 @@ def dispatch(request):
                 error = DesktopError("客户端正在处理其他桌面操作，请稍后再新建对话。")
                 error.not_submitted = True
                 raise error from None
-            current = check_ready(request)
+            current = check_ready({**request, "for_send": False})
             page, _ = document()
             button = find("push button", "New", page)
             if not showing(button) or not button.queryAction().doAction(0):

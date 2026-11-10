@@ -35,6 +35,7 @@ WEB = Path(__file__).parent / "mobile_web"
 TERMINAL_STATES = {"translated", "pasted", "submitted", "failed", "unknown"}
 ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 MAX_UPLOAD = 256 * 1024 * 1024
+RUNNING_ATTACHMENT_REASON = "Claude 正在运行，可追加文字；附件请在 Ubuntu 添加或等任务空闲后发送。"
 DESKTOP_KEYS = {"Return", "Enter", "Tab", "BackSpace", "Delete", "Escape", "Left", "Right", "Up", "Down",
                 "Home", "End", "Prior", "Next", "Page_Up", "Page_Down", "Shift_L+Tab", "Alt_L+Tab", "Super_L",
                 "Control_L+a", "Control_L+c", "Control_L+v", "Control_L+x", "Control_L+z", "Control_L+y", "Control_L+s",
@@ -702,10 +703,22 @@ class MobileBridge:
             "ready", "mode", "title", "context", "workspace", "reason", "busy", "window_visible", "new_session",
             "project_title", "session_title")}
         result["awaiting_input"] = target.get("awaiting_input") is True
+        if "send_ready" in target:
+            result["send_ready"] = target.get("send_ready") is True and not result["awaiting_input"]
+        if isinstance(target.get("send_reason"), str):
+            result["send_reason"] = target["send_reason"].strip()[:500]
+        if target.get("send_mode") in {"idle", "running_insert", "unavailable"}:
+            result["send_mode"] = target["send_mode"]
         result["draft_chars"] = target.get("draft_chars", len(target.get("draft", "")))
+        if (target.get("approval") is True or target.get("locked") is True or target.get("window_visible") is False
+                or target.get("attachments") or isinstance(result["draft_chars"], int) and result["draft_chars"] > 0):
+            if "send_ready" in result:
+                result["send_ready"] = False
         capabilities = target.get("capabilities")
         capabilities = capabilities if isinstance(capabilities, dict) else {}
         result["capabilities"] = {"native_attachments": capabilities.get("native_attachments") is True}
+        if "running_attachments" in capabilities:
+            result["capabilities"]["running_attachments"] = capabilities.get("running_attachments") is True
         reason = attachment_reason(target, "")
         if not result["capabilities"]["native_attachments"] and reason:
             result["capabilities"]["attachment_reason"] = reason
@@ -764,7 +777,7 @@ class MobileBridge:
                 previous_waiting = self.reply.get("awaiting_input") is True
                 if self.target.get("context") != context or self.target_probe_connection != connection_key:
                     self.target = self.safe_target({"context": context, "mode": reply.get("mode"),
-                        "title": reply.get("title", "当前会话"), "ready": False,
+                        "title": reply.get("title", "当前会话"), "ready": False, "send_ready": False,
                         "reason": "当前任务回复已读取，正在确认输入状态…"})
                 elif reply.get("generating"):
                     self.target = {**self.target, "ready": False, "busy": True, "reason": "Claude 正在回复"}
@@ -777,7 +790,7 @@ class MobileBridge:
                 need_probe = not awaiting_input and (self.target_probe_context != context
                               or self.target_probe_connection != connection_key
                               or time.monotonic() - self.last_target_probe >= 30
-                              or previous_generating and not reply.get("generating")
+                              or previous_generating != bool(reply.get("generating"))
                               or previous_waiting)
             if not need_probe:
                 return
@@ -808,7 +821,8 @@ class MobileBridge:
                         self.capture_wake.set()
             except Exception:
                 with self.lock:
-                    self.target = {**self.target, "ready": False,
+                    self.target = {**self.target, "ready": False, "send_ready": False,
+                                   "send_mode": "unavailable", "send_reason": "输入状态暂未确认，正在重新连接。",
                                    "reason": "当前任务回复已读取；输入状态暂未确认，正在重新连接。"}
             finally:
                 self.last_target_probe = time.monotonic()
@@ -821,7 +835,8 @@ class MobileBridge:
 
     def capture_failed(self, message):
         with self.lock:
-            self.target = {**self.target, "ready": False, "awaiting_input": False, "reason": message}
+            self.target = {**self.target, "ready": False, "send_ready": False, "send_mode": "unavailable",
+                           "send_reason": message, "awaiting_input": False, "reason": message}
             self.reply = {"text": "", "source_hash": "", "mode": self.reply.get("mode", ""),
                           "context": self.target.get("context", ""), "loading": False, "generating": False,
                           "updated_at": 0, "error": message, "read_status": "error", "read_reason": message}
@@ -854,10 +869,15 @@ class MobileBridge:
             self.code_blocks = [value for value in reply.get("code_blocks", []) if isinstance(value, str)]
             if self.target.get("context") == expected_context:
                 if awaiting_input:
-                    self.target = {**self.target, "ready": False, "busy": False, "awaiting_input": True,
+                    self.target = {**self.target, "ready": False, "send_ready": False, "busy": False, "awaiting_input": True,
+                                   "send_mode": "unavailable", "send_reason": "Claude 正在等待你选择，请到 Ubuntu 查看并操作。",
                                    "reason": "Claude 正在等待你选择，请到 Ubuntu 查看并操作。"}
                 else:
+                    previous_waiting = self.target.get("awaiting_input") is True
                     self.target = {**self.target, "awaiting_input": False}
+                    if previous_waiting:
+                        self.target = {**self.target, "send_ready": False, "send_mode": "unavailable",
+                                       "send_reason": "正在确认输入状态…", "reason": "正在确认输入状态…"}
 
     def translate_reply(self, payload):
         if payload.get("incremental"):
@@ -1105,12 +1125,17 @@ class MobileBridge:
                     self.update_job(job_id, "submitted", phase, result)
                     self.capture_wake.set()
                     return True
-                ready = client.action("check_ready", context=payload["expected_context"], timeout=90)
+                send_intent = {"for_send": True} if action in {"send", "translate_send"} else {}
+                ready = client.action("check_ready", context=payload["expected_context"], timeout=90, **send_intent)
                 if action == "new":
                     delivery_started = True
                     result = client.action("new", context=ready["context"])
                     self.update_job(job_id, "submitted", "已打开新会话", result)
                     return True
+                if (payload["attachment_ids"] and ready.get("mode") == "Code"
+                        and (ready.get("busy") is True or ready.get("allow_running") is True)
+                        and (ready.get("capabilities") or {}).get("running_attachments") is not True):
+                    raise core.BridgeError(RUNNING_ATTACHMENT_REASON)
                 if (payload["attachment_ids"] and ready.get("mode") == "Code"
                         and (ready.get("capabilities") or {}).get("native_attachments") is not True):
                     raise core.BridgeError(attachment_reason(ready, "当前 Code 客户端的附件载入尚未就绪，请刷新连接状态后重试。"))

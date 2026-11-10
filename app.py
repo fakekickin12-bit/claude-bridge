@@ -1483,12 +1483,15 @@ class Window(QMainWindow):
         def work():
             nonlocal delivery_started, draft_fingerprint
             bundle = None
-            ready = client.action("check_ready", timeout=90)
+            ready = client.action("check_ready", for_send=True, timeout=90)
             if (paths and ready.get("mode") == "Code"
                     and (ready.get("capabilities") or {}).get("native_attachments") is not True):
                 reason = (ready.get("capabilities") or {}).get("attachment_reason")
                 reason = reason.strip()[:500] if isinstance(reason, str) else ""
                 raise BridgeError(reason or "当前 Code 客户端的附件入口不可用，请到 Ubuntu 查看附件输入区。")
+            if (paths and ready.get("busy") is True
+                    and (ready.get("capabilities") or {}).get("running_attachments") is not True):
+                raise BridgeError("Claude 正在运行，可追加文字指令；附件请在 Ubuntu 添加，或等任务空闲后发送。")
             if paths:
                 bundle = build_bundle(paths, previews, self.cancel_transfer, self.transfer_progress.emit)
                 receipts.extend({"name": f["name"], "local_path": f["path"], "kind": f["kind"], "size": f["size"], "sha256": f["sha256"]} for f in bundle["originals"])

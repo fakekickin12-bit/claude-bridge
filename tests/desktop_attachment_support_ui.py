@@ -23,6 +23,7 @@ def main():
         capabilities = {"native_attachments": False,
                         "attachment_reason": "当前窗口未开放文件拖入接口，请在 Ubuntu 手动添加附件。"}
         calls, warnings = [], []
+        runtime = {"busy": False}
         context, batch = "a" * 64, "b" * 32
 
         class Remote:
@@ -30,7 +31,9 @@ def main():
             def action(self, action, **payload):
                 calls.append((action, payload))
                 if action == "check_ready":
-                    return {"ready": True, "mode": "Code", "context": context, "capabilities": dict(capabilities)}
+                    assert payload.get("for_send") is True
+                    return {"ready": True, "mode": "Code", "context": context, "busy": runtime["busy"],
+                            "capabilities": dict(capabilities)}
                 assert action == "send", "No translation, navigation, receipt polling or implicit retries"
                 assert payload["attachment_batch"] == batch and payload["enter"] is False
                 assert payload["context"] == context and payload["text"].startswith("Inspect this screenshot.")
@@ -69,9 +72,17 @@ def main():
             assert window.history[0]["state"] == "not_sent" and not window.pending_deliveries
             capabilities.clear()
             capabilities["native_attachments"] = True
+            capabilities["running_attachments"] = False
+            runtime["busy"] = True
             window.send()
             qt.processEvents()
-            assert [name for name, _ in calls] == ["check_ready", "check_ready", "send"]
+            assert "可追加文字指令" in window.upload_status.text()
+            assert (window.source.toPlainText(), window.english.toPlainText(), window.attachments) == before
+            assert not build.called and not upload.called
+            runtime["busy"] = False
+            window.send()
+            qt.processEvents()
+            assert [name for name, _ in calls] == ["check_ready", "check_ready", "check_ready", "send"]
             assert build.call_count == upload.call_count == 1
             assert window.history[0]["state"] == "pasted" and not window.pending_deliveries
             assert not window.busy
