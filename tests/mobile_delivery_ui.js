@@ -165,6 +165,7 @@ async function slowReceiptConfirmsWithoutAnotherPost() {
   assert.equal(page.draft().lastUncertain.payload.english, "", "Keep the exact original request intact");
   assert.equal(page.elements.get("send-button").disabled, true);
   assert.equal(page.elements.get("translate-send-button").disabled, true);
+  assert.match(page.elements.get("draft-state").textContent, /发送结果未确认/);
   const revision = page.draft().revision;
   for (service.clock = 1000; service.clock <= 110000; service.clock += 1000) {
     page.poll();
@@ -258,6 +259,7 @@ async function oldReceiptCannotClearANewerPendingJob() {
   service.deferNextPost = true;
   page.click("send-button");
   await settle(() => Boolean(service.postRelease), "new request POST in flight");
+  assert.match(page.elements.get("draft-state").textContent, /正在发送.*等待 Ubuntu 确认/);
   const secondId = page.draft().pendingJob.id;
   service.clock = 110000;
   page.poll();

@@ -204,7 +204,10 @@
   function renderDraftState() {
     const stale = Boolean(ui.english.value.trim()) && boundSource !== ui.source.value;
     const hasDraft = Boolean(ui.source.value.trim() || ui.english.value.trim() || attachmentItems.length);
-    ui.draftState.textContent = stale ? "中文已修改，请重新翻译" :
+    const activeDraft = pendingJob && sameSnapshot(pendingJob.snapshot);
+    ui.draftState.textContent = activeDraft ? pendingJob.action === "translate" ? "正在翻译当前草稿" :
+      deliveryActions.has(pendingJob.action) ? "正在发送当前草稿，等待 Ubuntu 确认" : "当前操作正在处理" :
+      uncertainDraftMatches() ? "发送结果未确认，请勿重复提交" : stale ? "中文已修改，请重新翻译" :
       hasDraft ? ui.english.value.trim() ? "当前草稿尚未发送" : "当前草稿尚未翻译和发送" : "";
   }
 
@@ -712,6 +715,7 @@
   }
 
   function renderControls() {
+    renderDraftState();
     const target = serverState?.target || {};
     const online = Boolean(serverState?.worker?.online);
     const localBusy = Boolean(pendingJob || posting || uploadCount);
