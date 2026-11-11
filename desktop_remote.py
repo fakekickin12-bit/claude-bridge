@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -712,8 +712,11 @@ def attachment_support_signature(process_id, entry, controls):
             or add_attrs.get("haspopup") != "menu"):
         return None
     try:
-        executable = Path(os.readlink("/proc/" + str(process_id) + "/exe"))
-        metadata = executable.stat()
+        process_executable = Path("/proc") / str(process_id) / "exe"
+        executable = Path(os.readlink(process_executable))
+        # Package updates can unlink the old executable while its process and
+        # window remain valid. Stat the live /proc handle, not its stale name.
+        metadata = process_executable.stat()
     except OSError:
         return None
     return {"schema": 1, "mode": "Code", "executable": str(executable),

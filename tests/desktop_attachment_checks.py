@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import shutil
+import subprocess
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -36,6 +38,35 @@ def fails(operation):
     except d.DesktopError:
         return
     raise AssertionError("Unsafe attachment state was accepted")
+
+
+# An updater can replace a running executable on disk. Exercise the real Linux
+# /proc semantics rather than mocking the signature function that gates sends.
+with tempfile.TemporaryDirectory(prefix="bridge-updated-executable-") as directory, \
+     patch.object(d,"showing",side_effect=lambda node:node.visible):
+    binary=Path(directory)/"running-test-process"
+    shutil.copy2("/bin/sleep",binary)
+    child=subprocess.Popen([str(binary),"30"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        prompt=Node("entry","Prompt",["class:tiptap ProseMirror","tag:div"])
+        add=Node("push button","Add",["haspopup:menu","tag:button"])
+        controls=Node("section",children=[prompt,add])
+        before=d.attachment_support_signature(child.pid,prompt,controls)
+        assert before and before['size']>0
+        binary.unlink()
+        after=d.attachment_support_signature(child.pid,prompt,controls)
+        assert after and after['executable'].endswith(' (deleted)')
+        assert (before['size'],before['mtime_ns'])==(after['size'],after['mtime_ns'])
+        add.visible=False
+        assert d.attachment_support_signature(child.pid,prompt,controls) is None
+        add.visible=True
+        controls.children.append(Node('push button','Add',['haspopup:menu']))
+        assert d.attachment_support_signature(child.pid,prompt,controls) is None
+        controls.children.pop()
+        prompt.attrs=['class:unrelated-editor']
+        assert d.attachment_support_signature(child.pid,prompt,controls) is None
+    finally:
+        child.terminate();child.wait(timeout=5)
 
 
 # A read-only transport preflight may inspect window properties, but may not
