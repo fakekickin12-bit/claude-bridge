@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -37,6 +37,10 @@ class ClientUnavailable(DesktopError):
 
 
 class WindowUnavailable(DesktopError):
+    pass
+
+
+class HiddenX11Window(WindowUnavailable):
     pass
 
 
@@ -277,7 +281,7 @@ def window_id():
         connection = display.Display(environment()["DISPLAY"])
     except Exception:
         raise DesktopError("无法连接 Ubuntu 图形桌面，请确认桌面已登录且可用。") from None
-    found = []
+    found, owned = [], 0
     try:
         root = connection.screen().root
         clients = root.get_full_property(connection.intern_atom("_NET_CLIENT_LIST"), X.AnyPropertyType)
@@ -287,6 +291,7 @@ def window_id():
                 owner = window.get_full_property(connection.intern_atom("_NET_WM_PID"), X.AnyPropertyType)
                 classes = window.get_wm_class() or ()
                 if owner is not None and len(owner.value) and int(owner.value[0]) == pid and any("claude" in c.lower() for c in classes):
+                    owned += 1
                     if window.get_attributes().map_state == X.IsViewable:
                         found.append(int(wid))
             except error.BadWindow:
@@ -294,6 +299,8 @@ def window_id():
     finally:
         connection.close()
     if not found:
+        if owned:
+            raise HiddenX11Window("Claude 主窗口当前未显示，请点击“打开 / 显示客户端”恢复窗口。")
         raise WindowUnavailable("Bridge 未找到可输入的 Claude 窗口。请点击“打开 / 显示客户端”；若仍失败，请在 Ubuntu 完全退出 Claude 后再从 Bridge 打开。")
     if len(found) != 1:
         raise DesktopError("未找到唯一的 Claude 桌面窗口。")
@@ -310,11 +317,126 @@ def desktop_locked():
         return False
 
 
+def native_input_frame():
+    """Bind the visible page to its own active AT-SPI frame, without X11 IDs."""
+    application = app()
+    page, attrs = document(application)
+    frame = page
+    for _ in range(40):
+        if frame is None:
+            break
+        if frame.getRoleName() == "frame":
+            break
+        frame = frame.parent
+    else:
+        frame = None
+    if frame is None or frame.getRoleName() != "frame":
+        raise DesktopError("尚未确认 Claude 当前页面所属窗口，请在 Ubuntu 显示当前会话。")
+    if hasattr(frame, "clear_cache"):
+        frame.clear_cache()
+    pid = application.get_process_id()
+    if frame.get_process_id() != pid or not showing(frame):
+        raise DesktopError("Claude 当前页面所属窗口已变化，已停止输入。")
+    if not frame.getState().contains(initialize().STATE_ACTIVE):
+        raise DesktopError("请在 Ubuntu 点击当前 Claude 窗口，让它处于前台后再发送。")
+    return {"kind": "wayland", "frame_id": accessible_key(frame), "process_id": pid,
+            "context": page_context(application, page, attrs)}
+
+
+def input_window():
+    try:
+        return window_id()
+    except HiddenX11Window:
+        raise
+    except WindowUnavailable:
+        return native_input_frame()
+
+
+class NativeKeyboard:
+    """A short-lived GNOME keyboard session; no screen stream or app restart."""
+    REMOTE = "org.gnome.Mutter.RemoteDesktop"
+    KEYS = {"Control_L+v": (0xffe3, ord("v")), "Return": (0xff0d,)}
+
+    def __init__(self):
+        initialize()
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib, self.path = Gio, GLib, None
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.owner = self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                               "GetNameOwner", "(s)", (self.REMOTE,))[0]
+        self.require_unlocked()
+        try:
+            self.path = self.call(self.REMOTE, "/org/gnome/Mutter/RemoteDesktop", self.REMOTE, "CreateSession")[0]
+            self.call(self.REMOTE, self.path, self.REMOTE + ".Session", "Start")
+        except Exception:
+            self.close()
+            raise DesktopError("Ubuntu 原生键盘通道尚未就绪，尚未输入或提交；请稍后重试。") from None
+
+    def call(self, destination, path, interface, method, signature=None, arguments=()):
+        result = self.bus.call_sync(destination, path, interface, method,
+            self.GLib.Variant(signature, arguments) if signature else None, None,
+            self.Gio.DBusCallFlags.NONE, 2000, None)
+        return result.unpack() if result is not None else ()
+
+    def require_unlocked(self):
+        try:
+            active = self.call("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver", "GetActive")[0]
+        except Exception:
+            raise DesktopError("无法确认 Ubuntu 锁屏状态，已停止原生输入。") from None
+        if active is not False:
+            raise DesktopError("Ubuntu 桌面已锁定，请先解锁。")
+
+    def key(self, name):
+        symbols = self.KEYS[name]
+        owner = self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "GetNameOwner", "(s)", (self.REMOTE,))[0]
+        if owner != self.owner or self.path is None:
+            raise DesktopError("Ubuntu 原生键盘会话已变化，已停止输入。")
+        self.require_unlocked()
+        pressed, release_failed = [], False
+        try:
+            for symbol in symbols:
+                pressed.append(symbol)
+                self.call(self.REMOTE, self.path, self.REMOTE + ".Session", "NotifyKeyboardKeysym", "(ub)", (symbol, True))
+        finally:
+            for symbol in reversed(pressed):
+                try:
+                    self.call(self.REMOTE, self.path, self.REMOTE + ".Session", "NotifyKeyboardKeysym", "(ub)", (symbol, False))
+                except Exception:
+                    release_failed = True
+            if release_failed:
+                self.close()
+                raise DesktopError("原生按键释放未确认，已关闭本次键盘通道；请核对 Ubuntu，不会自动重发。")
+
+    def close(self):
+        if self.path is not None:
+            try:
+                self.call(self.REMOTE, self.path, self.REMOTE + ".Session", "Stop")
+            except Exception:
+                pass
+            self.path = None
+
+
+def require_native_focus(target, context, draft, *, allow_running=False):
+    """Slow status checks precede the final exact focused-entry check."""
+    current = status()
+    require_attachment_draft(current, context, [], draft.strip(), allow_running=allow_running)
+    latest = native_input_frame()
+    if latest != target or latest["context"] != context or current.get("process_id") != target["process_id"]:
+        raise DesktopError("Ubuntu 原生输入目标已变化，已保留草稿。")
+    entry = composer()
+    if (not entry.getState().contains(initialize().STATE_FOCUSED) or not showing(entry)
+            or text(entry).strip() != draft.strip() or visible_menus()):
+        raise DesktopError("Claude 输入框未保持焦点或草稿已变化，已停止原生输入。")
+
+
 def activate():
     initialize()
     if desktop_locked():
         raise DesktopError("Ubuntu 桌面已锁定，请先在 Ubuntu 解锁后再发送。")
-    wid = window_id()
+    wid = input_window()
+    if isinstance(wid, dict):
+        return wid
     from Xlib import X, display, error, protocol
     connection = display.Display(environment()["DISPLAY"])
     try:
@@ -355,6 +477,15 @@ def focus_composer(expected_context=None, expected_draft="", *, allow_running=Fa
     from Xlib import X, display
     from Xlib.ext import xtest
     wid = activate()
+    if isinstance(wid, dict):
+        if not expected_context or wid["context"] != expected_context or visible_menus():
+            raise DesktopError("Claude 原生输入目标或菜单状态尚未确认，已停止输入。")
+        entry = composer()
+        if not entry.getState().contains(initialize().STATE_FOCUSED):
+            if not entry.queryComponent().grabFocus():
+                raise DesktopError("Claude 输入框未获得焦点，请在 Ubuntu 点击当前输入框。")
+        require_native_focus(wid, expected_context, expected_draft, allow_running=allow_running)
+        return wid
     connection = display.Display(environment()["DISPLAY"])
     try:
         root = connection.screen().root
@@ -1740,7 +1871,7 @@ def status():
     locked = desktop_locked()
     window_error = ""
     try:
-        window_id()
+        target_window = input_window()
         visible = True
     except DesktopError as exc:
         visible = False
@@ -1794,7 +1925,7 @@ def check_ready(request):
     if not eligible(state):
         raise DesktopError("Claude 客户端尚未就绪：" + state.get("send_reason" if for_send else "reason", "请保留或处理现有草稿/附件，关闭弹窗，或等待当前回复完成。"))
     try:
-        window_id()
+        target_window = input_window()
     except WindowUnavailable:
         original_context = state["context"]
         start(request)
@@ -1803,7 +1934,9 @@ def check_ready(request):
             raise DesktopError("客户端恢复后对话发生变化，尚未发送。请检查 Ubuntu 的目标对话后再发送。")
         if not eligible(state):
             raise DesktopError("客户端窗口已恢复，但尚未就绪：" + state["reason"])
+        target_window = input_window()
     return {"ready": True, "context": state["context"], "title": state["title"],
+            "input_transport": "wayland" if isinstance(target_window, dict) else "x11",
             "mode": state.get("mode", "Chat"),
             "capabilities": state.get("capabilities", {"native_attachments": False}),
             "busy": bool(state.get("busy")), "send_ready": True if for_send else bool(state.get("send_ready", state["ready"])),
@@ -1988,7 +2121,7 @@ def running_enter_ready(initial, value):
     require_attachment_draft(current, initial["context"], [], value.strip(), allow_running=True)
     if current.get("process_id") != initial.get("process_id"):
         raise DesktopError("追加消息的客户端已经变化，已保留草稿。")
-    wid = window_id()
+    wid = input_window()
     application = app()
     page, attrs = document(application)
     if page_context(application, page, attrs) != initial["context"]:
@@ -2002,6 +2135,10 @@ def running_enter_ready(initial, value):
             or not all(state.contains(flag) for flag in (atspi.STATE_FOCUSED, atspi.STATE_ENABLED, atspi.STATE_EDITABLE))
             or text(entry).strip() != value.strip()):
         raise DesktopError("追加消息输入框未保持精确焦点或草稿已变化，请到 Ubuntu 查看。")
+    if isinstance(wid, dict):
+        if wid["context"] != initial["context"] or wid["process_id"] != initial.get("process_id"):
+            raise DesktopError("追加消息的原生窗口已经变化，已保留草稿。")
+        return
     from Xlib import X, display
     connection = display.Display(environment()["DISPLAY"])
     try:
@@ -2071,18 +2208,20 @@ def paste(value, expected_context=None, *, allow_running=False):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=True)
     previous = read()
     data = value.encode("utf-8")
-    if allow_running:
-        focus_composer(expected_context, allow_running=True)
-    else:
-        focus_composer(expected_context)
-    write(data)
+    target = (focus_composer(expected_context, allow_running=True) if allow_running else focus_composer(expected_context))
+    keyboard = NativeKeyboard() if isinstance(target, dict) else None
     try:
+        write(data)
         for _ in range(10):
             if read() == data:
                 break
             time.sleep(.05)
         time.sleep(.15)
-        xcommand("key", "--clearmodifiers", "ctrl+v")
+        if keyboard is not None:
+            require_native_focus(target, expected_context, "", allow_running=allow_running)
+            keyboard.key("Control_L+v")
+        else:
+            xcommand("key", "--clearmodifiers", "ctrl+v")
         for _ in range(60):
             pump_events()
             if text(composer()).strip() == value.strip():
@@ -2090,8 +2229,12 @@ def paste(value, expected_context=None, *, allow_running=False):
             time.sleep(.1)
         raise DesktopError("客户端文字载入未确认，消息尚未提交。请查看 Ubuntu 草稿，避免重复载入。")
     finally:
-        if read() == data:
-            write(previous or b"")
+        try:
+            if read() == data:
+                write(previous or b"")
+        finally:
+            if keyboard is not None:
+                keyboard.close()
 
 
 def ensure_workspace(request):
@@ -2422,7 +2565,15 @@ def send(request):
             if send_button is None:
                 # One ordinary Return follows the native running-Prompt contract.
                 # Never send Stop, Ctrl+Enter, or another Return after an unknown.
-                xcommand("key", "Return")
+                if initial.get("input_transport") == "wayland":
+                    keyboard = NativeKeyboard()
+                    try:
+                        running_enter_ready(initial, value)
+                        keyboard.key("Return")
+                    finally:
+                        keyboard.close()
+                else:
+                    xcommand("key", "Return")
             elif not send_button.queryAction().doAction(0):
                 raise DesktopError("客户端未接受发送操作，请查看 Ubuntu。")
             deadline = time.monotonic() + (45 if initial.get("new_session") else 20)

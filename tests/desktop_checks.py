@@ -322,11 +322,11 @@ with patch.object(d, "initialize"), patch.object(d, "desktop_locked", return_val
 hidden = {"context": "same", "ready": False, "input_ready": True}
 visible = {"context": "same", "title": "existing chat", "ready": True}
 with patch.object(d, "status", side_effect=[hidden, visible]), \
-     patch.object(d, "window_id", side_effect=d.WindowUnavailable("hidden")), patch.object(d, "start") as restore:
+     patch.object(d, "input_window", side_effect=[d.WindowUnavailable("hidden"), 123]), patch.object(d, "start") as restore:
     assert d.check_ready({"context": "same"})["context"] == "same"
     assert restore.call_count == 1
 with patch.object(d, "status", side_effect=[hidden, {**visible, "context": "changed"}]), \
-     patch.object(d, "window_id", side_effect=d.WindowUnavailable("hidden")), patch.object(d, "start"):
+     patch.object(d, "input_window", side_effect=d.WindowUnavailable("hidden")), patch.object(d, "start"):
     try:
         d.check_ready({"context": "same"})
         raise AssertionError("changed conversation after restore accepted")

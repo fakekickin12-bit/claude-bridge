@@ -65,6 +65,7 @@ jobs:
           python tests/desktop_capture_checks.py
           python tests/desktop_question_checks.py
           python tests/desktop_running_send_checks.py
+          python tests/desktop_native_input_checks.py
           python tests/desktop_projects_checks.py
           python tests/desktop_match_checks.py
           python tests/desktop_collection_checks.py

@@ -271,6 +271,27 @@ with tempfile.TemporaryDirectory(prefix="bridge-running-send-") as directory:
             key.assert_called_once_with("key", "Return")
             focused.assert_called_once_with(initial, value)
             assert not stop_action.called
+        # Native Wayland fallback keeps the same once-only receipt and strict
+        # focus gate, using its own compositor keyboard rather than X11.
+        sent['done'] = False
+        native_request = {**request, 'request_id': 'e' * 32}
+        native_ledger = root/'desktop-deliveries'/('e'*32+'.json')
+        def native_return(name):
+            assert name == 'Return'
+            assert json.loads(native_ledger.read_text())['state'] == 'submitting'
+            sent['done'] = True
+        native_keyboard = SimpleNamespace(key=Mock(side_effect=native_return),close=Mock())
+        with ExitStack() as stack:
+            overrides={**common,'check_ready':Mock(return_value={**initial,'input_transport':'wayland'}),
+                       'buttons':Mock(return_value=[stop]),'running_enter_ready':Mock(),
+                       'NativeKeyboard':Mock(return_value=native_keyboard),
+                       'xcommand':Mock(side_effect=AssertionError('Wayland used X11 Return'))}
+            for name,replacement in overrides.items():stack.enter_context(patch.object(d,name,replacement))
+            stack.enter_context(patch.object(d.time,'sleep'))
+            assert d.send(native_request)['state'] == 'submitted'
+            assert d.send(native_request)['repeated'] is True
+            native_keyboard.key.assert_called_once_with('Return');native_keyboard.close.assert_called_once()
+            assert overrides['running_enter_ready'].call_count == 2
         # A delayed queue item may be acknowledged later by the SAME receipt.
         pending = json.loads(ledger.read_text())
         pending["state"] = "submitting"; pending.pop("submission_evidence", None)

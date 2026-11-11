@@ -33,7 +33,7 @@ SSH → Ubuntu 图形会话中的 Claude 客户端
 | Windows | Python 3.11 或更高版本（使用便携包无需另装 Python）、OpenSSH 客户端；保存 API Key 使用当前 Windows 账户的 DPAPI |
 | 翻译服务 | 自己的 API Key；或已通过 ChatGPT 登录、模型可用的本机 Codex CLI |
 | Ubuntu | 已能正常使用 Claude Desktop、包含 Chat / Code 页面的图形会话，以及 SSH 访问 |
-| 图形控制 | GNOME / AT-SPI 无障碍接口和可操作的 X11 / XWayland 客户端窗口；纯 Wayland 窗口不保证可用 |
+| 图形控制 | GNOME / AT-SPI 无障碍接口；支持 X11 / XWayland，原生 GNOME Wayland 文字输入需 Claude 当前窗口位于前台 |
 | 视频附件（可选） | Windows 的 PATH 中可找到 FFmpeg 和 FFprobe |
 
 本工具通过原生桌面控件和文件拖入操作客户端，不读取客户端的登录令牌。客户端更新、界面语言和桌面环境变化都可能影响控件识别。
@@ -87,6 +87,8 @@ Bridge 的「配置 Ubuntu」还会从 Ubuntu 软件仓库下载并解包用户�
 「匹配当前对话」只读取当前会话身份和最新回复，保留本机草稿与附件，不提交消息。
 
 Code 任务运行中可用原来的发送按钮追加文字，客户端会在当前动作完成后接收补充内容。新建会话仍需空闲；已有草稿、提问和权限弹窗仍需先处理。运行中选择的附件可保留在本机，等任务空闲后再发送。
+
+原生 GNOME Wayland 窗口不需要退出重开：将当前 Claude 会话置于前台后，Bridge 会核对窗口、会话和输入框，再通过临时原生键盘通道粘贴并提交。附件拖放仍需可用的 X11 / XWayland 传输；通道不可用时会保留文字，不会重复发送。
 
 ### 4. 翻译与发送
 
