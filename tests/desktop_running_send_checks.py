@@ -124,6 +124,12 @@ with patch.object(d, "app", return_value=application), patch.object(d, "document
      patch.object(d, "page_context", return_value=context), patch.object(d, "code_panel", return_value=tail_page):
     tail_proof = d.running_submission_confirmed(initial, current, expected_hash, tail_baseline)
     assert tail_proof["kind"] == "new_user_message" and len(tail_proof["message_id_hash"]) == 64
+    # An unrelated newer turn must not hide an already delivered queued item.
+    newest = human("A later independent prompt", True)
+    tail_container.children.extend([assistant_row(), newest])
+    assert d.running_user_snapshot(tail_page, read_text=True, after_tail=tail.path)["text"] == value
+    assert d.running_submission_confirmed(initial, current, expected_hash, tail_baseline) == tail_proof
+    tail_container.children = [tail, later]
     assert not d.running_submission_confirmed(initial, current, d.normalized_message_hash("Different message"), tail_baseline)
     # A prior identical prompt being mounted again is not the submitted copy.
     prior_identical = human(value, True)
@@ -182,6 +188,18 @@ with tempfile.TemporaryDirectory(prefix="bridge-running-send-") as directory:
     root = Path(directory)
     (root / "desktop.lock").touch()
     with patch.object(d, "ROOT", root), patch.object(r, "ROOT", root):
+        # A new request rejected at the input lock is known unsubmitted. It
+        # never loads text/files or creates a false forever-pending receipt.
+        with (root/'desktop.lock').open('a') as other_input, \
+             patch.object(d,'check_ready',side_effect=AssertionError('Busy input reached UI')):
+            d.fcntl.flock(other_input,d.fcntl.LOCK_EX|d.fcntl.LOCK_NB)
+            busy_id='9'*32
+            error=rejected(lambda:d.send({'request_id':busy_id,'context':context,'text':value,'enter':True}))
+            assert error.not_submitted is True
+            assert not (root/'desktop-deliveries'/(busy_id+'.json')).exists()
+            r.atomic(root/'desktop-deliveries'/(busy_id+'.json'),{'state':'submitting'})
+            error=rejected(lambda:d.send({'request_id':busy_id,'context':context,'text':value,'enter':True}))
+            assert not error.not_submitted
         rid = "c" * 32
         request = {"request_id": rid, "context": context, "text": value, "enter": True}
         ledger = root / "desktop-deliveries" / (rid + ".json")
@@ -297,6 +315,29 @@ with tempfile.TemporaryDirectory(prefix="bridge-running-send-") as directory:
         pending["state"] = "submitting"; pending.pop("submission_evidence", None)
         r.atomic(ledger, pending)
         lookup = {"request_id": rid, "fingerprint": pending["fingerprint"]}
+        # Slow read-only receipt checks must leave the input lock available.
+        def inspect_without_input_lock():
+            with (root/'desktop.lock').open('a') as new_send:
+                d.fcntl.flock(new_send,d.fcntl.LOCK_EX|d.fcntl.LOCK_NB)
+            return current
+        with patch.object(d,'status',side_effect=inspect_without_input_lock), \
+             patch.object(d,'running_submission_confirmed',return_value=False):
+            assert not d.delivery_status(lookup)['completed']
+        # A real input already holding the global lock skips UI inspection.
+        with (root/'desktop.lock').open('a') as actual_send, \
+             patch.object(d,'status',side_effect=AssertionError('Receipt competed with active input')):
+            d.fcntl.flock(actual_send,d.fcntl.LOCK_EX|d.fcntl.LOCK_NB)
+            assert not d.delivery_status(lookup)['completed']
+        # A receipt changed during observation cannot be falsely confirmed or
+        # relabeled with the caller's old fingerprint.
+        def altered_receipt(*args):
+            r.atomic(ledger,{**pending,'fingerprint':'f'*64,'state':'submitted'})
+            return proof
+        with patch.object(d,'status',return_value=current), \
+             patch.object(d,'running_submission_confirmed',side_effect=altered_receipt):
+            assert not d.delivery_status(lookup)['completed']
+            assert json.loads(ledger.read_text())['fingerprint']=='f'*64
+        r.atomic(ledger,pending)
         with patch.object(d, "status", return_value=current) as status, \
              patch.object(d, "running_submission_confirmed", return_value=False) as verify, \
              patch.object(d, "send", side_effect=AssertionError("Receipt replayed send")):

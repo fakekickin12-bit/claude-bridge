@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -2018,7 +2018,9 @@ def running_user_snapshot(page, *, read_text=False, after_tail=None):
                 if is_assistant and accessible_key(node) == after_tail:
                     found_tail = True
                     break
-                if selected is None and is_user:
+                if is_user:
+                    # Keep the first human AFTER the original tail, even if
+                    # newer human turns have since appeared in the same feed.
                     selected = node
             else:
                 if tail is None and is_assistant:
@@ -2104,6 +2106,7 @@ def running_submission_confirmed(initial, current, expected_hash, baseline):
         raise DesktopError("核对追加消息时客户端已切换会话，结果未确认。")
     after = (running_user_snapshot(code_panel(page), read_text=True, after_tail=baseline["tail_id"])
              if baseline.get("anchor_kind") == "tail_row" else running_user_snapshot(code_panel(page), read_text=True))
+    confirm_page_context(initial["context"])
     if (after["feed_id"] != baseline["feed_id"] or after["message_id"] == baseline.get("message_id")
             or normalized_message_hash(after["text"]) != expected_hash):
         return False
@@ -2166,7 +2169,10 @@ def reconcile_running_delivery(ledger, record):
             or not re.fullmatch(r"[a-f0-9]{64}", pending["expected_text_sha256"])):
         return record
     try:
-        descriptor = os.open(ROOT / "desktop.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        # Serialize only this receipt while observing UI. Holding desktop.lock
+        # through a read-only AT-SPI scan starves new sends behind old receipts.
+        receipt_path = ledger.with_suffix(".reconcile.lock")
+        descriptor = os.open(receipt_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(descriptor, "a+b") as lock:
             info = os.fstat(lock.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
@@ -2175,15 +2181,33 @@ def reconcile_running_delivery(ledger, record):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return record
-            fresh = json.loads(ledger.read_text(encoding="utf-8"))
-            if (fresh.get("request_id") != record.get("request_id") or fresh.get("fingerprint") != record.get("fingerprint")
-                    or fresh.get("context") != record.get("context") or fresh.get("auto_enter") is not True
-                    or fresh.get("running_submission") != pending or fresh.get("state") != "submitting"):
-                return record
+            def unchanged(fresh):
+                return (isinstance(fresh, dict) and fresh.get("request_id") == record.get("request_id")
+                    and fresh.get("fingerprint") == record.get("fingerprint")
+                    and fresh.get("context") == record.get("context") and fresh.get("auto_enter") is True
+                    and fresh.get("running_submission") == pending and fresh.get("state") == "submitting")
+            desktop_fd = os.open(ROOT / "desktop.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(desktop_fd, "a+b") as desktop_lock:
+                info = os.fstat(desktop_lock.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                    return record
+                try:
+                    fcntl.flock(desktop_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return record
+                fresh = json.loads(ledger.read_text(encoding="utf-8"))
+                if not unchanged(fresh):
+                    return record
+                # No input is performed below. Release the global input lock
+                # before status/body reads; final context and ledger checks
+                # independently guard against a concurrent new send/navigation.
             initial = {"context": record["context"], "mode": "Code", "process_id": pending["process_id"]}
             proof = running_submission_confirmed(initial, status(), pending["expected_text_sha256"], pending)
             if proof:
                 import remote
+                fresh = json.loads(ledger.read_text(encoding="utf-8"))
+                if not unchanged(fresh):
+                    return record
                 fresh.update(state="submitted", submission_evidence=proof, reconciled_at=time.time())
                 remote.atomic(ledger, fresh)
                 return fresh
@@ -2514,7 +2538,11 @@ def send(request):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise DesktopError("客户端正在接收另一条指令。")
+            error = DesktopError("客户端正在接收另一条指令。")
+            # This fresh request did not acquire the input lock and has not
+            # loaded/submitted anything. A pre-existing ID remains uncertain.
+            error.not_submitted = not ledger.exists()
+            raise error from None
         if ledger.exists():
             saved = json.loads(ledger.read_text())
             if saved["fingerprint"] == fingerprint and saved["state"] in {"submitted", "pasted"}:
