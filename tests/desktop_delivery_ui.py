@@ -90,7 +90,7 @@ def main():
     warnings = []
     with tempfile.TemporaryDirectory(prefix="bridge-desktop-delivery-") as directory:
         root = Path(directory)
-        for name in ("immediate", "late", "changed", "pasted", "pasted-auto", "history-error", "restart", "running", "running-pasted"):
+        for name in ("immediate", "late", "changed", "changed-empty", "pasted", "pasted-auto", "history-error", "restart", "running", "running-pasted"):
             data = root / name
             config = core.defaults()
             config["ssh"]["host"] = "synthetic-host"
@@ -156,6 +156,22 @@ def main():
                 if name == "immediate":
                     assert not window.source.toPlainText() and not window.english.toPlainText()
                     assert window.history[0]["state"] == "submitted" and not window.pending_deliveries
+                    assert not window.send_button.isEnabled()
+                    window.source.setPlainText("新的一条尚未翻译的指令")
+                    assert window.badge.text() == "尚未发送"
+                    assert "尚未翻译和提交" in window.note.text()
+                    assert "已清空" not in window.note.text() and not window.send_button.isEnabled()
+                    window.english.setPlainText("A new unsent instruction.")
+                    assert window.badge.text() == "尚未发送" and window.send_button.isEnabled()
+                    window.source.setPlainText("再次改动中文")
+                    assert window.badge.text() == "待重新翻译" and not window.send_button.isEnabled()
+                    with desktop.QSignalBlocker(window.source), desktop.QSignalBlocker(window.english):
+                        window.source.clear(); window.english.clear()
+                    window.draft_source = None
+                    attachment = data / "new.txt"
+                    attachment.write_text("synthetic", encoding="utf-8")
+                    window.add_attachments([str(attachment)])
+                    assert window.badge.text() == "尚未发送" and not window.send_button.isEnabled()
                 elif name == "pasted":
                     assert window.history[0]["state"] == "pasted"
                     assert (window.source.toPlainText(), window.english.toPlainText(), window.attachments) == before
@@ -182,13 +198,15 @@ def main():
                             assert record["id"] in window.pending_deliveries
                             assert window.english.toPlainText() == before[1]
                             window.config["ssh"]["host"] = "synthetic-other-host"
-                        if name == "changed":
+                        if name in {"changed", "changed-empty"}:
                             window.source.setPlainText("新的合成草稿")
                             window.english.setPlainText("A new draft.")
                             attachment = data / "new.txt"
                             attachment.parent.mkdir(parents=True, exist_ok=True)
                             attachment.write_text("synthetic", encoding="utf-8")
                             window.add_attachments([str(attachment)])
+                            if name == "changed-empty":
+                                window.english.clear()
                             edited = (window.source.toPlainText(), window.english.toPlainText(), list(window.attachments))
                         remote.receipt_state = "submitted"
                         remote.read_checks = True
@@ -196,8 +214,12 @@ def main():
                         assert not window.pending_deliveries and not window.delivery_job
                         assert remote.count("send") == count
                         assert window.history[0]["state"] == "submitted"
-                        if name == "changed":
+                        if name in {"changed", "changed-empty"}:
                             assert (window.source.toPlainText(), window.english.toPlainText(), window.attachments) == edited
+                            assert window.badge.text() == "尚未发送"
+                            assert ("尚未翻译和提交" if name == "changed-empty" else "尚未发送") in window.note.text()
+                            assert "上一条消息" in window.statusBar().currentMessage()
+                            assert window.send_button.isEnabled() == (name == "changed")
                         else:
                             assert not window.source.toPlainText() and not window.english.toPlainText()
                         reads = [target for action, _, target in remote.calls if action == "delivery_status"]

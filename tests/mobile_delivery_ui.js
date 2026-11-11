@@ -179,6 +179,12 @@ async function slowReceiptConfirmsWithoutAnotherPost() {
   assert.match(page.elements.get("notice").textContent, /Ubuntu 回执确认提交/);
   assert.equal(service.posts.length, 1);
   assert.equal(service.translationCalls, 1);
+  page.edit("source", "下一条尚未翻译的指令");
+  assert.equal(page.elements.get("job-status").hidden, true, "Prior success must not label the new draft as sent");
+  assert.match(page.elements.get("notice").textContent, /当前草稿尚未发送/);
+  assert.match(page.elements.get("draft-state").textContent, /尚未翻译和发送/);
+  assert.equal(page.elements.get("send-button").disabled, true);
+  assert.equal(service.posts.length, 1, "Draft edits never submit another request");
   assert(service.reads.every(read => read.id === id));
   for (let index = 1; index < service.reads.length; index += 1) {
     assert(service.reads[index].clock - service.reads[index - 1].clock >= 5000, "Unknown receipts should be checked about every five seconds");
@@ -201,7 +207,9 @@ async function editedDraftAndFailedTranslationRecovery() {
   await settle(() => page.draft().receiptJobs.length === 0, "edited draft receipt confirmed");
   assert.equal(page.elements.get("source").value, "新的合成草稿");
   assert.equal(page.elements.get("english").value, "A newly edited draft.");
-  assert.match(page.elements.get("notice").textContent, /草稿已保留/);
+  assert.match(page.elements.get("notice").textContent, /草稿.*已保留/);
+  assert.match(page.elements.get("job-title").textContent, /上一条/);
+  assert.match(page.elements.get("notice").textContent, /当前草稿尚未发送/);
 
   const failedService = new DeliveryService();
   failedService.initialState = "failed";
@@ -256,6 +264,7 @@ async function oldReceiptCannotClearANewerPendingJob() {
   await settle(() => !page.draft().receiptJobs.some(job => job.id === firstId), "older receipt reconciled");
   assert.equal(page.draft().pendingJob.id, secondId);
   assert.equal(page.elements.get("english").value, "Another synthetic task in English.");
+  assert.match(page.elements.get("notice").textContent, /当前请求仍在处理中/);
   service.postRelease();
   await flush();
   assert.equal(service.posts.length, 2);

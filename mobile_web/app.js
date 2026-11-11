@@ -59,6 +59,7 @@
   let attachmentItems = [];
   let uploadCount = 0;
   let pendingJob = null;
+  let composeResultShown = false;
   let pendingReplyJob = null;
   let lastUncertain = null;
   let posting = false;
@@ -190,6 +191,11 @@
   function draftChanged(englishEdited = false) {
     if (englishEdited) boundSource = ui.source.value;
     draftRevision += 1;
+    if (!pendingJob && !posting && composeResultShown) {
+      ui.jobStatus.hidden = true;
+      composeResultShown = false;
+      showNotice("当前草稿尚未发送。");
+    }
     saveDraft();
     renderDraftState();
     renderControls();
@@ -197,7 +203,9 @@
 
   function renderDraftState() {
     const stale = Boolean(ui.english.value.trim()) && boundSource !== ui.source.value;
-    ui.draftState.textContent = stale ? "中文已修改，请重新翻译" : "";
+    const hasDraft = Boolean(ui.source.value.trim() || ui.english.value.trim() || attachmentItems.length);
+    ui.draftState.textContent = stale ? "中文已修改，请重新翻译" :
+      hasDraft ? ui.english.value.trim() ? "当前草稿尚未发送" : "当前草稿尚未翻译和发送" : "";
   }
 
   function showNotice(message, error = false) {
@@ -866,6 +874,7 @@
     ui.jobTitle.textContent = `${actionLabels[job.action] || "任务"} · ${label}`;
     ui.jobDetail.textContent = job.error || job.phase || "";
     ui.jobSpinner.hidden = terminalStates.has(job.state);
+    composeResultShown = deliveryActions.has(job.action) && ["submitted", "pasted"].includes(job.state);
   }
 
   function handleJob(job) {
@@ -976,9 +985,15 @@
         draftRevision += 1;
         renderAttachments();
       }
-      showNotice(receiptConfirmed ? unchanged ? "已通过 Ubuntu 回执确认提交，输入内容已清空。" :
-        "已通过 Ubuntu 回执确认提交。你继续编辑的草稿已保留。" :
-        unchanged ? "已提交到 Ubuntu 当前会话，输入内容已清空。" : "已提交到 Ubuntu。你继续编辑的草稿已保留。");
+      if (!unchanged) {
+        const newerPending = pendingJob && pendingJob.id !== job.id;
+        if (!newerPending) ui.jobTitle.textContent = `上一条${actionLabels[job.action] || "发送"} · 已提交`;
+        showNotice(newerPending ? "上一条请求已确认提交。当前请求仍在处理中，草稿已保留。" :
+          "上一条请求已确认提交。当前草稿尚未发送，已保留。");
+      } else {
+        showNotice(receiptConfirmed ? "已通过 Ubuntu 回执确认提交，输入内容已清空。" :
+          "已提交到 Ubuntu 当前会话，输入内容已清空。");
+      }
     } else if (job.state === "pasted") {
       if (unchanged && job.english) {
         ui.english.value = job.english;

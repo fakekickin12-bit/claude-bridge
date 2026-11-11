@@ -954,6 +954,7 @@ class Window(QMainWindow):
         actions = QHBoxLayout()
         self.translate_button = button("仅翻译", lambda: self.translate(False))
         self.send_button = button("发送英文稿", self.send)
+        self.send_button.setEnabled(False)
         self.both_button = button("翻译并发送", lambda: self.translate(True), True)
         for b in [self.translate_button, self.send_button, self.both_button]:
             actions.addWidget(b)
@@ -1126,6 +1127,7 @@ class Window(QMainWindow):
                                      "拖入图片、视频或文件，Ctrl+V 粘贴截图。视频以抽帧预览和元数据载入 Claude。")
         if hasattr(self, "draft_timer"):
             self.draft_timer.start(500)
+        self.refresh_draft_state()
 
     def save_draft(self):
         try:
@@ -1233,13 +1235,36 @@ class Window(QMainWindow):
             self.statusBar().showMessage("已切换翻译连接：" + self.config["profiles"][pid].get("label", pid))
 
     def source_changed(self):
-        if self.english.toPlainText() and self.draft_source != self.source.toPlainText():
-            self.note.setText("中文已修改。请重新翻译，或编辑英文稿后再发送。")
+        self.refresh_draft_state()
 
     def english_changed(self):
         if not self.busy:
             self.draft_source = self.source.toPlainText()
-            self.note.setText("英文稿已编辑，将发送这里显示的内容。")
+            self.refresh_draft_state()
+
+    def refresh_draft_state(self):
+        """Describe this editor's draft, never the success of a prior request."""
+        if self.busy or not hasattr(self, "send_button"):
+            return
+        source, english = self.source.toPlainText(), self.english.toPlainText()
+        pending = any(self.delivery_draft_matches(record) and record["target"] == self.config["ssh"]
+                      for record in self.pending_deliveries.values())
+        valid = bool(english.strip()) and self.draft_source == source
+        self.send_button.setEnabled(valid and not pending)
+        if pending:
+            badge, note = "结果未确认", "当前草稿的发送结果正在按原编号核对，请勿重复提交。"
+        elif english.strip() and not valid:
+            badge, note = "待重新翻译", "中文已修改。请重新翻译，或编辑英文稿后再发送。"
+        elif valid:
+            badge, note = "尚未发送", "英文稿已就绪，当前草稿尚未发送。"
+        elif source.strip() or self.attachments:
+            badge, note = "尚未发送", "当前草稿尚未翻译和提交，请点击“翻译并发送”。"
+        else:
+            badge, note = "准备就绪", "可先检查英文稿，也可一键翻译并发送。"
+        self.badge.setText(badge)
+        self.note.setText(note)
+        self.upload_status.clear()
+
 
     def copy_english(self):
         value = self.english.toPlainText()
@@ -1261,6 +1286,8 @@ class Window(QMainWindow):
             self.cancel_upload_button.setEnabled(False)
             self.cancel_upload_button.setVisible(False)
             self.transfer_stage = "idle"
+            self.send_button.setEnabled(bool(self.english.toPlainText().strip())
+                                        and self.draft_source == self.source.toPlainText())
 
     def update_menu_state(self):
         actions = [*self.settings_actions.values(), *self.connection_actions.values(),
@@ -1447,6 +1474,7 @@ class Window(QMainWindow):
             self.note.setText(f"已翻译 · {result['model']}" + (f" · {tokens} tokens" if tokens else "") + "。英文稿可继续编辑。")
             if send_after:
                 self.send()
+        self.note.setText("正在翻译当前草稿，尚未提交到 Ubuntu。")
         self.job("正在翻译…", lambda: client.translate(source), done)
 
     def send(self):
@@ -1547,6 +1575,7 @@ class Window(QMainWindow):
                 self.badge.setText("尚未发送")
             self.upload_status.setText(error + ("；本机发送记录写入失败。" if not written else ""))
             self.load_history()
+        self.note.setText("正在发送当前草稿，等待 Ubuntu 确认。")
         self.job("正在准备附件…" if paths else "正在发送…", work, done, failed)
         self.cancel_upload_button.setEnabled(bool(paths))
         self.cancel_upload_button.setVisible(bool(paths))
@@ -1586,7 +1615,12 @@ class Window(QMainWindow):
             self.pending_deliveries[rid] = record
         written = self.write_delivery_history(record, state if confirmed else "unconfirmed", error)
         unchanged = self.delivery_draft_matches(record)
-        if not self.busy:
+        has_draft = bool(self.source.toPlainText().strip() or self.english.toPlainText().strip() or self.attachments)
+        if not self.busy and not unchanged and has_draft:
+            self.refresh_draft_state()
+            self.statusBar().showMessage(f"上一条消息 {rid[:8]} " + ("已确认提交；当前草稿尚未发送。" if state == "submitted" else
+                                          "的状态已更新；当前草稿已保留。"))
+        elif not self.busy:
             if confirmed and unchanged:
                 self.last_fingerprint = send_fingerprint(record["english"], record["target"], record.get("attachments"))
             if state == "submitted" and unchanged:
