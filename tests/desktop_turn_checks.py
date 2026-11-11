@@ -149,8 +149,35 @@ with tempfile.TemporaryDirectory(prefix="bridge-turn-check-") as directory, \
     assert d.current_turn_reply(unknown_page, "d" * 64)["read_status"] == "unavailable"
     no_anchor = row("No confirmed native human boundary")
     unanchored, _ = page_with([no_anchor])
-    assert d.current_turn_reply(unanchored, "e" * 64)["read_status"] == "unavailable"
-    assert leaf(no_anchor).names == 0
+    tail_only = d.current_turn_reply(unanchored, "e" * 64)
+    assert tail_only["read_status"] == "ready" and tail_only["scope"] == "latest"
+    assert tail_only["text"] == "No confirmed native human boundary" and tail_only["message_count"] == 1
+    assert tail_only["turn_id"] == "" and not tail_only["partial"]
+    assert "最后一条" in tail_only["read_reason"] and leaf(no_anchor).names == 1
+    assert not (Path(directory)/"reply-cursors"/('e'*64+'.json')).exists()
+
+    # A virtualized prompt must not blank the latest reply, reread old bodies,
+    # or overwrite a complete-turn cursor with an unanchored fragment.
+    virtual_prompt, previous_tail = human(), row("Previous tail")
+    virtual_page, virtual_history = page_with([virtual_prompt, previous_tail])
+    virtual_context = "9" * 64
+    assert d.current_turn_reply(virtual_page, virtual_context)["text"] == "Previous tail"
+    virtual_cache = Path(directory)/"reply-cursors"/(virtual_context+'.json')
+    saved_virtual_cache = virtual_cache.read_bytes()
+    virtual_history.children.remove(virtual_prompt)
+    leaf(previous_tail).forbid_name = True
+    visible_tail = row("The current visible response")
+    virtual_history.children.append(visible_tail)
+    virtual = d.current_turn_reply(virtual_page, virtual_context)
+    assert virtual["text"] == "The current visible response" and virtual["scope"] == "latest"
+    assert virtual_cache.read_bytes() == saved_virtual_cache
+    with patch.object(d, "confirm_page_context", side_effect=d.DesktopError("Changed context")):
+        try:
+            d.current_turn_reply(virtual_page, virtual_context)
+        except d.DesktopError:
+            pass
+        else:
+            raise AssertionError("An unanchored reply escaped its context check")
 
     # A new row appended during extraction yields a marked ordered prefix, then fills next poll.
     initial_row, appended = row("Before tool"), row("After tool")

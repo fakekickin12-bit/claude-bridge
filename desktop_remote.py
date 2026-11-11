@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path.home() / ".local/share/claude-bridge"
 TOOLS = ROOT / "desktop-tools"
-VERSION = "1.15.1"
+VERSION = "1.16.0"
 STOP_BUTTONS = {"Stop response", "Stop generating", "Stop", "Stop task"}
 CODE_LOCAL_SESSION = re.compile(r"/epitaxy/local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/?", re.IGNORECASE)
 CODE_NEW_PATHS = {"/epitaxy", "/epitaxy/"}
@@ -478,16 +478,40 @@ def drop_files(paths, expected_context=None):
         connection.close()
 
 
+def warm_document_tree(application):
+    """Wake lazy Electron document exports without entering any web history."""
+    remaining = [384]
+    def visit(node, depth=0):
+        remaining[0] -= 1
+        if remaining[0] < 0 or depth > 24:
+            return
+        role = node.getRoleName()
+        if role in {"document web", "article", "paragraph", "static", "text", "entry"}:
+            return
+        # Touching the native shell's children makes cold Electron WebContents
+        # join the Collection index. Never choose a document from this walk:
+        # the complete native role query still enforces URI and uniqueness.
+        count = node.childCount
+        for index in range(min(count, remaining[0])):
+            child = node.getChildAtIndex(index)
+            if child is not None:
+                visit(child, depth + 1)
+    visit(application)
+
+
 def document(application=None):
     if application is None:
         application = app()
     deadline = time.monotonic() + 4
+    warmed = False
     while True:
         pump_events()
         pages = []
         for node in role_nodes(application, ("document web",)):
             try:
                 if node.getRoleName() == "document web" and showing(node):
+                    if hasattr(node, "clear_cache"):
+                        node.clear_cache()
                     attrs = dict(item.split(":", 1) for item in node.queryDocument().getAttributes())
                     uri = urlsplit(attrs.get("URI", ""))
                     if uri.scheme == "https" and uri.netloc == "claude.ai":
@@ -496,6 +520,12 @@ def document(application=None):
                 pass
         if len(pages) == 1:
             return pages[0]
+        if not pages and not warmed:
+            warmed = True
+            try:
+                warm_document_tree(application)
+            except Exception:
+                pass
         if time.monotonic() >= deadline:
             break
         time.sleep(.15)
@@ -1063,6 +1093,11 @@ class ReplyReadLimit(DesktopError):
     pass
 
 
+class UnloadedTurnAnchor(ReplyReadLimit):
+    """The visible tail is readable, but an earlier human row is virtualized."""
+    pass
+
+
 REPLY_CONTAINER_LIMIT = 512
 REPLY_ARTICLE_LIMIT = 64
 REPLY_BODY_LIMIT = 12000
@@ -1492,7 +1527,7 @@ def current_turn_snapshot(page, context):
             raise ReplyReadLimit("本轮回复较多，尚未完整确认消息顺序；请稍后刷新，不会跳过中间内容。")
     if anchor is None:
         if rows:
-            raise ReplyReadLimit("本轮用户消息尚未载入，无法确认回复起点；请在 Ubuntu 显示当前对话后刷新。")
+            raise UnloadedTurnAnchor("较早的用户消息尚未载入。")
         return {"turn_id": "", "feed_id": feed_key, "rows": []}
     turn_id = hashlib.sha256(json.dumps([context, feed_key, anchor], ensure_ascii=False).encode()).hexdigest()
     rows.reverse()
@@ -1632,6 +1667,15 @@ def current_turn_reply(page, context):
             return {**empty, "text": body, "code_blocks": blocks, "reply_count": count, "message_count": count,
                     "turn_id": snapshot["turn_id"], "read_status": "ready" if body else "empty", "partial": partial,
                     "read_reason": "已读取本轮连续回复，下一次继续补齐。" if partial else "" if body else "等待 Claude 输出本轮回复。"}
+    except UnloadedTurnAnchor:
+        # Do not turn the mounted tail into a fabricated complete turn, or
+        # mix it with the old cursor. Only return the one latest native reply.
+        reply = latest_reply(page)
+        if reply.get("read_status") == "ready":
+            confirm_page_context(context)
+            return {**reply, "message_count": reply["reply_count"], "turn_id": "", "partial": False,
+                    "read_reason": "较早的用户消息未载入，已显示当前最后一条 Claude 回复。"}
+        return {**reply, "message_count": 0, "turn_id": "", "partial": False}
     except (ReplyReadLimit, DesktopError) as exc:
         return {**empty, "read_status": "unavailable", "read_reason": str(exc)}
     except Exception:
